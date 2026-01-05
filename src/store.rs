@@ -7,9 +7,10 @@ use rusqlite::{params, Connection};
 
 use crate::db::{get_max_memory_id, init_schema};
 use crate::error::MemoryError;
-use crate::memory::{AddMemoryResult, Memory};
+use crate::memory::{AddMemoryResult, Memory, Stats};
 use crate::relationship::{
-    add_relationship_event, canonicalize, get_relationship, StrengthenResult,
+    add_relationship_event, canonicalize, get_relationship, relationship_exists, ConnectResult,
+    StrengthenResult,
 };
 use crate::search::{surface_candidates, SearchResult};
 use crate::{SearchParams, MAX_STRENGTHEN_SET};
@@ -183,6 +184,63 @@ impl MemoryStore {
         })
     }
 
+    /// Connect memories that don't already have a relationship.
+    ///
+    /// Unlike strengthen(), this only creates a relationship if none exists.
+    /// Each new connection gets strength 1.0. Existing connections are skipped.
+    ///
+    /// This operation is wrapped in a transaction for atomicity.
+    pub fn connect(&mut self, ids: &[i64]) -> Result<ConnectResult, MemoryError> {
+        if ids.len() > MAX_STRENGTHEN_SET {
+            return Err(MemoryError::InvalidInput(format!(
+                "Cannot connect more than {} memories at once (got {})",
+                MAX_STRENGTHEN_SET,
+                ids.len()
+            )));
+        }
+
+        if ids.len() < 2 {
+            return Err(MemoryError::InvalidInput(
+                "At least two memory IDs are required to create connections".to_string(),
+            ));
+        }
+
+        let tx = self.conn.transaction()?;
+
+        let mut created = Vec::new();
+        let mut skipped = Vec::new();
+
+        let default_params = SearchParams::default();
+
+        // Generate all pairs and only add if no existing connection
+        for i in 0..ids.len() {
+            for j in (i + 1)..ids.len() {
+                let (from_mem, to_mem) = canonicalize(ids[i], ids[j]);
+
+                if relationship_exists(&tx, from_mem, to_mem)? {
+                    skipped.push((from_mem, to_mem));
+                } else {
+                    // Create new relationship with strength 1.0
+                    add_relationship_event(&tx, from_mem, to_mem, self.cached_max_mem, 1.0)?;
+
+                    if let Some(rel) = get_relationship(
+                        &tx,
+                        from_mem,
+                        to_mem,
+                        self.cached_max_mem,
+                        &default_params,
+                    )? {
+                        created.push(rel);
+                    }
+                }
+            }
+        }
+
+        tx.commit()?;
+
+        Ok(ConnectResult { created, skipped })
+    }
+
     /// Get a memory by ID.
     pub fn get(&self, id: i64) -> Result<Option<Memory>, MemoryError> {
         let mut stmt = self
@@ -199,15 +257,107 @@ impl MemoryStore {
     }
 
     /// Get the latest N memories, ordered by ID descending (most recent first).
+    /// Shorthand for `list(None, None, Some(n))`.
     pub fn tail(&self, n: usize) -> Result<Vec<Memory>, MemoryError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT id, datetime, text, source FROM memories ORDER BY id DESC LIMIT ?1")?;
+        self.list(None, None, Some(n))
+    }
 
-        let rows = stmt.query_map(params![n], |row| Self::row_to_memory(row))?;
+    /// List memories by ID range.
+    ///
+    /// - `from_id`: Start ID (inclusive). If None, starts from the beginning.
+    /// - `to_id`: End ID (inclusive). If None, goes to the end.
+    /// - `limit`: Maximum number of results. If None, returns all in range.
+    ///
+    /// Results are ordered by ID descending (most recent first).
+    pub fn list(
+        &self,
+        from_id: Option<i64>,
+        to_id: Option<i64>,
+        limit: Option<usize>,
+    ) -> Result<Vec<Memory>, MemoryError> {
+        let mut conditions = Vec::new();
+        let mut params_vec: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+        if let Some(from) = from_id {
+            conditions.push("id >= ?".to_string());
+            params_vec.push(Box::new(from));
+        }
+
+        if let Some(to) = to_id {
+            conditions.push("id <= ?".to_string());
+            params_vec.push(Box::new(to));
+        }
+
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", conditions.join(" AND "))
+        };
+
+        let limit_clause = if let Some(n) = limit {
+            params_vec.push(Box::new(n as i64));
+            " LIMIT ?".to_string()
+        } else {
+            String::new()
+        };
+
+        let query = format!(
+            "SELECT id, datetime, text, source FROM memories{} ORDER BY id DESC{}",
+            where_clause, limit_clause
+        );
+
+        let mut stmt = self.conn.prepare(&query)?;
+
+        let param_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
+        let rows = stmt.query_map(param_refs.as_slice(), |row| Self::row_to_memory(row))?;
 
         let memories: Result<Vec<_>, _> = rows.collect();
         Ok(memories?)
+    }
+
+    /// Get database statistics.
+    pub fn stats(&self) -> Result<Stats, MemoryError> {
+        let memory_count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))?;
+
+        let min_memory_id: Option<i64> =
+            self.conn
+                .query_row("SELECT MIN(id) FROM memories", [], |row| row.get(0))?;
+
+        let max_memory_id: Option<i64> =
+            self.conn
+                .query_row("SELECT MAX(id) FROM memories", [], |row| row.get(0))?;
+
+        // Count unique relationship pairs
+        let relationship_count: i64 = self.conn.query_row(
+            "SELECT COUNT(DISTINCT from_mem || '-' || to_mem) FROM relationships",
+            [],
+            |row| row.get(0),
+        )?;
+
+        // Count total relationship events
+        let relationship_event_count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM relationships", [], |row| row.get(0))?;
+
+        // Get unique sources
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT source FROM memories WHERE source IS NOT NULL ORDER BY source",
+        )?;
+        let sources: Vec<String> = stmt
+            .query_map([], |row| row.get(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        Ok(Stats {
+            memory_count,
+            min_memory_id,
+            max_memory_id,
+            relationship_count,
+            relationship_event_count,
+            unique_sources: sources,
+        })
     }
 
     /// Get multiple memories by their IDs.
@@ -386,5 +536,146 @@ mod tests {
         let result = store.search("cats", &params).unwrap();
         assert!(!result.memories.is_empty());
         assert!(result.memories[0].memory.text.contains("cats"));
+    }
+
+    #[test]
+    fn test_list() {
+        let mut store = MemoryStore::open_in_memory().unwrap();
+
+        store.add("First", Some("src1")).unwrap();
+        store.add("Second", Some("src1")).unwrap();
+        store.add("Third", Some("src2")).unwrap();
+        store.add("Fourth", None).unwrap();
+        store.add("Fifth", Some("src2")).unwrap();
+
+        // List all (no filters)
+        let all = store.list(None, None, None).unwrap();
+        assert_eq!(all.len(), 5);
+        // Should be ordered by ID descending
+        assert_eq!(all[0].id, 5);
+        assert_eq!(all[4].id, 1);
+
+        // List with from_id
+        let from_3 = store.list(Some(3), None, None).unwrap();
+        assert_eq!(from_3.len(), 3);
+        assert_eq!(from_3[0].id, 5);
+        assert_eq!(from_3[2].id, 3);
+
+        // List with to_id
+        let to_3 = store.list(None, Some(3), None).unwrap();
+        assert_eq!(to_3.len(), 3);
+        assert_eq!(to_3[0].id, 3);
+        assert_eq!(to_3[2].id, 1);
+
+        // List with range
+        let range = store.list(Some(2), Some(4), None).unwrap();
+        assert_eq!(range.len(), 3);
+        assert_eq!(range[0].id, 4);
+        assert_eq!(range[2].id, 2);
+
+        // List with limit
+        let limited = store.list(None, None, Some(2)).unwrap();
+        assert_eq!(limited.len(), 2);
+        assert_eq!(limited[0].id, 5);
+        assert_eq!(limited[1].id, 4);
+
+        // List with range and limit
+        let range_limited = store.list(Some(1), Some(5), Some(2)).unwrap();
+        assert_eq!(range_limited.len(), 2);
+    }
+
+    #[test]
+    fn test_tail_uses_list() {
+        let mut store = MemoryStore::open_in_memory().unwrap();
+
+        store.add("First", None).unwrap();
+        store.add("Second", None).unwrap();
+        store.add("Third", None).unwrap();
+
+        let tail = store.tail(2).unwrap();
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[0].id, 3);
+        assert_eq!(tail[1].id, 2);
+    }
+
+    #[test]
+    fn test_stats() {
+        let mut store = MemoryStore::open_in_memory().unwrap();
+
+        // Empty db stats
+        let stats = store.stats().unwrap();
+        assert_eq!(stats.memory_count, 0);
+        assert_eq!(stats.min_memory_id, None);
+        assert_eq!(stats.max_memory_id, None);
+        assert_eq!(stats.relationship_count, 0);
+        assert_eq!(stats.relationship_event_count, 0);
+        assert!(stats.unique_sources.is_empty());
+
+        // Add some memories
+        store.add("First", Some("src1")).unwrap();
+        store.add("Second", Some("src2")).unwrap();
+        store.add("Third", Some("src1")).unwrap();
+        store.add("Fourth", None).unwrap();
+
+        let stats = store.stats().unwrap();
+        assert_eq!(stats.memory_count, 4);
+        assert_eq!(stats.min_memory_id, Some(1));
+        assert_eq!(stats.max_memory_id, Some(4));
+        assert_eq!(stats.unique_sources, vec!["src1", "src2"]);
+
+        // Add relationships
+        store.strengthen(&[1, 2]).unwrap();
+        store.strengthen(&[1, 2, 3]).unwrap(); // adds events for (1,2), (1,3), (2,3)
+
+        let stats = store.stats().unwrap();
+        assert_eq!(stats.relationship_count, 3); // unique pairs: (1,2), (1,3), (2,3)
+        assert_eq!(stats.relationship_event_count, 4); // 1 + 3 events
+    }
+
+    #[test]
+    fn test_connect() {
+        let mut store = MemoryStore::open_in_memory().unwrap();
+
+        store.add("mem1", None).unwrap();
+        store.add("mem2", None).unwrap();
+        store.add("mem3", None).unwrap();
+        store.add("mem4", None).unwrap();
+
+        // Connect 1 and 2 - should create relationship
+        let result = store.connect(&[1, 2]).unwrap();
+        assert_eq!(result.created.len(), 1);
+        assert!(result.skipped.is_empty());
+        assert_eq!(result.created[0].from_mem, 1);
+        assert_eq!(result.created[0].to_mem, 2);
+
+        // Try to connect 1 and 2 again - should skip
+        let result = store.connect(&[1, 2]).unwrap();
+        assert!(result.created.is_empty());
+        assert_eq!(result.skipped.len(), 1);
+        assert_eq!(result.skipped[0], (1, 2));
+
+        // Connect 1, 2, 3 - (1,2) should skip, (1,3) and (2,3) should create
+        let result = store.connect(&[1, 2, 3]).unwrap();
+        assert_eq!(result.created.len(), 2);
+        assert_eq!(result.skipped.len(), 1);
+        assert_eq!(result.skipped[0], (1, 2));
+
+        // Verify stats
+        let stats = store.stats().unwrap();
+        assert_eq!(stats.relationship_count, 3); // (1,2), (1,3), (2,3)
+        assert_eq!(stats.relationship_event_count, 3); // only 1 event each (unlike strengthen)
+    }
+
+    #[test]
+    fn test_connect_validation() {
+        let mut store = MemoryStore::open_in_memory().unwrap();
+
+        // Single ID should fail
+        let err = store.connect(&[1]).unwrap_err();
+        assert!(matches!(err, MemoryError::InvalidInput(_)));
+
+        // Empty list should fail
+        let err = store.connect(&[]).unwrap_err();
+        assert!(matches!(err, MemoryError::InvalidInput(_)));
     }
 }

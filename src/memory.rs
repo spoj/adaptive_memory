@@ -17,3 +17,14 @@ pub struct Memory {
 pub struct AddMemoryResult {
     pub memory: Memory,
 }
+
+/// Database statistics.
+#[derive(Debug, Serialize)]
+pub struct Stats {
+    pub memory_count: i64,
+    pub min_memory_id: Option<i64>,
+    pub max_memory_id: Option<i64>,
+    pub relationship_count: i64,
+    pub relationship_event_count: i64,
+    pub unique_sources: Vec<String>,
+}

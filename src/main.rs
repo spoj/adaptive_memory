@@ -66,12 +66,36 @@ enum Commands {
         ids: String,
     },
 
-    /// Show the latest N memories
+    /// Connect memories (only if no existing relationship)
+    Connect {
+        /// Comma-separated list of memory IDs (max 10)
+        ids: String,
+    },
+
+    /// Show the latest N memories (shorthand for list --limit N)
     Tail {
         /// Number of memories to show (default: 10)
         #[arg(default_value_t = 10)]
         n: usize,
     },
+
+    /// List memories by ID range
+    List {
+        /// Start ID (inclusive)
+        #[arg(long)]
+        from: Option<i64>,
+
+        /// End ID (inclusive)
+        #[arg(long)]
+        to: Option<i64>,
+
+        /// Maximum number of results
+        #[arg(short, long)]
+        limit: Option<usize>,
+    },
+
+    /// Show database statistics
+    Stats,
 }
 
 fn main() {
@@ -134,6 +158,13 @@ fn run(command: Commands, db_path: &PathBuf) -> Result<(), Box<dyn std::error::E
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
 
+        Commands::Connect { ids } => {
+            let ids = parse_ids(&ids)?;
+            let mut store = MemoryStore::open(db_path)?;
+            let result = store.connect(&ids)?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+
         Commands::Tail { n } => {
             let store = MemoryStore::open(db_path)?;
             let memories = store.tail(n)?;
@@ -142,6 +173,22 @@ fn run(command: Commands, db_path: &PathBuf) -> Result<(), Box<dyn std::error::E
                 "memories": memories
             });
             println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+
+        Commands::List { from, to, limit } => {
+            let store = MemoryStore::open(db_path)?;
+            let memories = store.list(from, to, limit)?;
+            let result = serde_json::json!({
+                "count": memories.len(),
+                "memories": memories
+            });
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+
+        Commands::Stats => {
+            let store = MemoryStore::open(db_path)?;
+            let stats = store.stats()?;
+            println!("{}", serde_json::to_string_pretty(&stats)?);
         }
     }
 

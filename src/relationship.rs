@@ -35,6 +35,15 @@ pub struct StrengthenResult {
     pub event_count: usize,
 }
 
+/// Result of connecting memories (only creates if no existing connection).
+#[derive(Debug, Serialize)]
+pub struct ConnectResult {
+    /// Relationships that were created (pairs that had no prior connection).
+    pub created: Vec<Relationship>,
+    /// Pairs that were skipped because they already had a connection.
+    pub skipped: Vec<(i64, i64)>,
+}
+
 /// Calculate effective strength given stored strength, memory distance, and decay factor.
 /// All relationships are now explicit (temporal removed), so no weight multiplier needed.
 pub fn calculate_effective_strength(
@@ -74,6 +83,23 @@ pub(crate) fn add_relationship_event<C: std::ops::Deref<Target = Connection>>(
     )?;
 
     Ok(())
+}
+
+/// Check if a relationship exists between two memories (order doesn't matter).
+pub(crate) fn relationship_exists<C: std::ops::Deref<Target = Connection>>(
+    conn: &C,
+    a: i64,
+    b: i64,
+) -> Result<bool> {
+    let (from_mem, to_mem) = canonicalize(a, b);
+
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM relationships WHERE from_mem = ?1 AND to_mem = ?2",
+        rusqlite::params![from_mem, to_mem],
+        |row| row.get(0),
+    )?;
+
+    Ok(count > 0)
 }
 
 /// Get aggregated relationship between two memories (order doesn't matter).
