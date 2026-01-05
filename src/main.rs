@@ -96,6 +96,13 @@ enum Commands {
 
     /// Show database statistics
     Stats,
+
+    /// Sample unconnected (stray) memories
+    Stray {
+        /// Number of stray memories to sample (default: 10)
+        #[arg(default_value_t = 10)]
+        n: usize,
+    },
 }
 
 fn main() {
@@ -189,6 +196,16 @@ fn run(command: Commands, db_path: &PathBuf) -> Result<(), Box<dyn std::error::E
             let store = MemoryStore::open(db_path)?;
             let stats = store.stats()?;
             println!("{}", serde_json::to_string_pretty(&stats)?);
+        }
+
+        Commands::Stray { n } => {
+            let store = MemoryStore::open(db_path)?;
+            let memories = store.stray(n)?;
+            let result = serde_json::json!({
+                "count": memories.len(),
+                "memories": memories
+            });
+            println!("{}", serde_json::to_string_pretty(&result)?);
         }
     }
 

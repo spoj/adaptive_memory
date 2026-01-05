@@ -315,6 +315,27 @@ impl MemoryStore {
         Ok(memories?)
     }
 
+    /// Sample unconnected (stray) memories - memories with no relationships.
+    ///
+    /// Returns up to `limit` memories that have no connections, ordered randomly.
+    pub fn stray(&self, limit: usize) -> Result<Vec<Memory>, MemoryError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT m.id, m.datetime, m.text, m.source
+             FROM memories m
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM relationships r
+                 WHERE r.from_mem = m.id OR r.to_mem = m.id
+             )
+             ORDER BY RANDOM()
+             LIMIT ?1",
+        )?;
+
+        let rows = stmt.query_map(params![limit as i64], |row| Self::row_to_memory(row))?;
+
+        let memories: Result<Vec<_>, _> = rows.collect();
+        Ok(memories?)
+    }
+
     /// Get database statistics.
     pub fn stats(&self) -> Result<Stats, MemoryError> {
         let memory_count: i64 =
