@@ -27,7 +27,16 @@ Instead of pre-computed temporal relationships, use `--context N` to fetch N mem
 
 ## Installation
 
+### From crates.io
+
 ```bash
+cargo install adaptive_memory
+```
+
+### From source
+
+```bash
+git clone https://github.com/spoj/adaptive_memory
 cd adaptive_memory
 cargo build --release
 # Binary at: target/release/adaptive-memory
@@ -41,8 +50,14 @@ adaptive-memory [OPTIONS] <COMMAND>
 Commands:
   init        Initialize the database
   add         Add a new memory
+  amend       Amend (update) an existing memory's text
   search      Search for memories
   strengthen  Strengthen relationships between memories
+  connect     Connect memories (only if no existing relationship)
+  tail        Show the latest N memories
+  list        List memories by ID range
+  stats       Show database statistics
+  stray       Sample unconnected (stray) memories
 
 Global Options:
   --db <PATH>  Database path (default: ~/.adaptive_memory.db)
@@ -182,6 +197,116 @@ adaptive-memory strengthen 1,5,12,34
   ],
   "event_count": 1
 }
+```
+
+### Connect Memories
+
+Like `strengthen`, but only creates relationships if none exist between the pair.
+
+```bash
+adaptive-memory connect <IDS>
+
+Arguments:
+  <IDS>  Comma-separated memory IDs (max 10)
+```
+
+**Example:**
+```bash
+# Connect memories only if not already related
+adaptive-memory connect 42,38,15
+```
+
+### Amend Memory
+
+Update the text of an existing memory. Only allowed if the memory has no relationships to later memories (preserves integrity of memories that later entries depend on).
+
+```bash
+adaptive-memory amend <ID> <TEXT>
+
+Arguments:
+  <ID>    Memory ID to amend
+  <TEXT>  New text for the memory
+```
+
+**Example:**
+```bash
+# Fix a typo in memory 42
+adaptive-memory amend 42 "Had coffee with Sarah, discussed the new project timeline"
+```
+
+### List Memories
+
+List memories by ID range.
+
+```bash
+adaptive-memory list [OPTIONS]
+
+Options:
+  --from <FROM>    Start ID (inclusive)
+  --to <TO>        End ID (inclusive)
+  -l, --limit <N>  Maximum number of results
+```
+
+**Examples:**
+```bash
+# List memories 10-20
+adaptive-memory list --from 10 --to 20
+
+# List last 50 memories
+adaptive-memory list --limit 50
+```
+
+### Tail
+
+Show the latest N memories (shorthand for `list --limit N`).
+
+```bash
+adaptive-memory tail [N]
+
+Arguments:
+  [N]  Number of memories to show (default: 10)
+```
+
+**Example:**
+```bash
+# Show last 5 memories
+adaptive-memory tail 5
+```
+
+### Stats
+
+Show database statistics including memory count, relationship count, and graph metrics.
+
+```bash
+adaptive-memory stats
+```
+
+**Output:**
+```json
+{
+  "memory_count": 1234,
+  "relationship_count": 567,
+  "connected_memories": 890,
+  "stray_memories": 344,
+  "avg_connections": 1.27
+}
+```
+
+### Stray
+
+Sample unconnected (stray) memories - useful for finding memories that could benefit from being linked to others.
+
+```bash
+adaptive-memory stray [N]
+
+Arguments:
+  [N]  Number of stray memories to sample (default: 10)
+```
+
+**Example:**
+```bash
+# Find 5 unconnected memories to review
+adaptive-memory stray 5
 ```
 
 ## FTS5 Query Syntax
