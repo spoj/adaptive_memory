@@ -1,6 +1,6 @@
 //! Relationship management and decay calculations.
 
-use rusqlite::{params, Connection, Result};
+use rusqlite::{Connection, Result, params};
 use serde::Serialize;
 
 use crate::SearchParams;
@@ -58,11 +58,7 @@ pub fn calculate_effective_strength(
 
 /// Canonicalize memory IDs for relationship storage (smaller first).
 pub(crate) fn canonicalize(a: i64, b: i64) -> (i64, i64) {
-    if a < b {
-        (a, b)
-    } else {
-        (b, a)
-    }
+    if a < b { (a, b) } else { (b, a) }
 }
 
 /// Add a new relationship event (used internally).

@@ -4,7 +4,7 @@ use std::process;
 use clap::{Parser, Subcommand};
 
 use adaptive_memory::{
-    default_db_path, MemoryError, MemoryStore, SearchParams, DEFAULT_LIMIT, MAX_STRENGTHEN_SET,
+    DEFAULT_LIMIT, MAX_STRENGTHEN_SET, MemoryError, MemoryStore, SearchParams, default_db_path,
 };
 
 #[derive(Parser)]
@@ -36,6 +36,15 @@ enum Commands {
         /// Optional datetime override (RFC3339 format, e.g. "2024-01-15T10:30:00Z")
         #[arg(short, long)]
         datetime: Option<String>,
+    },
+
+    /// Amend (update) an existing memory's text
+    Amend {
+        /// Memory ID to amend
+        id: i64,
+
+        /// New text for the memory
+        text: String,
     },
 
     /// Search for memories using text query and spreading activation
@@ -137,6 +146,12 @@ fn run(command: Commands, db_path: &PathBuf) -> Result<(), Box<dyn std::error::E
         } => {
             let mut store = MemoryStore::open(db_path)?;
             let result = store.add_with_options(&text, source.as_deref(), datetime.as_deref())?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+
+        Commands::Amend { id, text } => {
+            let mut store = MemoryStore::open(db_path)?;
+            let result = store.amend(id, &text)?;
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
 

@@ -3,17 +3,17 @@
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 
 use crate::db::{get_max_memory_id, init_schema};
 use crate::error::MemoryError;
-use crate::memory::{AddMemoryResult, GraphStats, Memory, Stats};
+use crate::memory::{AddMemoryResult, AmendResult, GraphStats, Memory, Stats};
 use crate::relationship::{
-    add_relationship_event, canonicalize, get_relationship, relationship_exists, ConnectResult,
-    StrengthenResult,
+    ConnectResult, StrengthenResult, add_relationship_event, canonicalize, get_relationship,
+    relationship_exists,
 };
-use crate::search::{surface_candidates, SearchResult};
-use crate::{SearchParams, MAX_STRENGTHEN_SET};
+use crate::search::{SearchResult, surface_candidates};
+use crate::{MAX_STRENGTHEN_SET, SearchParams};
 
 /// The main interface for the adaptive memory system.
 ///
@@ -112,6 +112,51 @@ impl MemoryStore {
         };
 
         Ok(AddMemoryResult { memory })
+    }
+
+    /// Amend (update) an existing memory's text.
+    ///
+    /// Only allowed if the memory has no relationships to memories with higher IDs.
+    /// This ensures we don't modify memories that later memories depend on.
+    pub fn amend(&mut self, id: i64, new_text: &str) -> Result<AmendResult, MemoryError> {
+        // Check if memory exists
+        let memory = self
+            .get(id)?
+            .ok_or_else(|| MemoryError::InvalidInput(format!("Memory {} does not exist", id)))?;
+
+        // Check for relationships to later memories
+        let has_later_relationship: bool = self.conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM relationships
+                WHERE (from_mem = ?1 AND to_mem > ?1)
+                   OR (to_mem = ?1 AND from_mem > ?1)
+            )",
+            params![id],
+            |row| row.get(0),
+        )?;
+
+        if has_later_relationship {
+            return Err(MemoryError::InvalidInput(format!(
+                "Cannot amend memory {} - it has relationships to later memories",
+                id
+            )));
+        }
+
+        // Update the memory text
+        self.conn.execute(
+            "UPDATE memories SET text = ?1 WHERE id = ?2",
+            params![new_text, id],
+        )?;
+
+        // Return updated memory
+        let updated = Memory {
+            id: memory.id,
+            datetime: memory.datetime,
+            text: new_text.to_string(),
+            source: memory.source,
+        };
+
+        Ok(AmendResult { memory: updated })
     }
 
     /// Search for memories using text query and spreading activation.
@@ -802,6 +847,43 @@ mod tests {
 
         // Empty list should fail
         let err = store.connect(&[]).unwrap_err();
+        assert!(matches!(err, MemoryError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn test_amend() {
+        let mut store = MemoryStore::open_in_memory().unwrap();
+
+        store.add("Original text", Some("test")).unwrap();
+        store.add("Second memory", None).unwrap();
+        store.add("Third memory", None).unwrap();
+
+        // Amend memory 3 (no relationships) - should succeed
+        let result = store.amend(3, "Updated third").unwrap();
+        assert_eq!(result.memory.id, 3);
+        assert_eq!(result.memory.text, "Updated third");
+
+        // Verify the change persisted
+        let mem = store.get(3).unwrap().unwrap();
+        assert_eq!(mem.text, "Updated third");
+
+        // Amend memory 1 (no relationships yet) - should succeed
+        let result = store.amend(1, "Updated first").unwrap();
+        assert_eq!(result.memory.text, "Updated first");
+
+        // Create relationship from 1 to 2 (later memory)
+        store.connect(&[1, 2]).unwrap();
+
+        // Amend memory 1 - should fail (has relationship to later memory 2)
+        let err = store.amend(1, "Try again").unwrap_err();
+        assert!(matches!(err, MemoryError::InvalidInput(_)));
+
+        // Amend memory 2 - should succeed (only has relationship to earlier memory 1)
+        let result = store.amend(2, "Updated second").unwrap();
+        assert_eq!(result.memory.text, "Updated second");
+
+        // Amend non-existent memory - should fail
+        let err = store.amend(999, "Nope").unwrap_err();
         assert!(matches!(err, MemoryError::InvalidInput(_)));
     }
 }

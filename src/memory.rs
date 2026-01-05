@@ -18,6 +18,12 @@ pub struct AddMemoryResult {
     pub memory: Memory,
 }
 
+/// Result of amending a memory.
+#[derive(Debug, Serialize)]
+pub struct AmendResult {
+    pub memory: Memory,
+}
+
 /// Database statistics.
 #[derive(Debug, Serialize)]
 pub struct Stats {

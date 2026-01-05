@@ -3,13 +3,13 @@
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde::Serialize;
 
 use crate::error::MemoryError;
 use crate::memory::Memory;
 use crate::relationship::get_relationships_for_memory;
-use crate::{SearchParams, ENERGY_THRESHOLD, MAX_SPREADING_ITERATIONS};
+use crate::{ENERGY_THRESHOLD, MAX_SPREADING_ITERATIONS, SearchParams};
 
 /// A memory with its activation energy.
 #[derive(Debug, Serialize)]
