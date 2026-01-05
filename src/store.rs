@@ -7,7 +7,7 @@ use rusqlite::{params, Connection};
 
 use crate::db::{get_max_memory_id, init_schema};
 use crate::error::MemoryError;
-use crate::memory::{AddMemoryResult, Memory, Stats};
+use crate::memory::{AddMemoryResult, GraphStats, Memory, Stats};
 use crate::relationship::{
     add_relationship_event, canonicalize, get_relationship, relationship_exists, ConnectResult,
     StrengthenResult,
@@ -371,6 +371,9 @@ impl MemoryStore {
             .filter_map(|r| r.ok())
             .collect();
 
+        // Graph metrics
+        let graph = self.compute_graph_stats()?;
+
         Ok(Stats {
             memory_count,
             min_memory_id,
@@ -378,6 +381,96 @@ impl MemoryStore {
             relationship_count,
             relationship_event_count,
             unique_sources: sources,
+            graph,
+        })
+    }
+
+    /// Compute graph-oriented statistics.
+    fn compute_graph_stats(&self) -> Result<GraphStats, MemoryError> {
+        use std::collections::{HashMap, HashSet};
+
+        // Count stray memories (no connections)
+        let stray_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM memories m
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM relationships r
+                 WHERE r.from_mem = m.id OR r.to_mem = m.id
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+
+        // Build adjacency list for connected component analysis
+        let mut adj: HashMap<i64, HashSet<i64>> = HashMap::new();
+
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT from_mem, to_mem FROM relationships")?;
+        let edges = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
+
+        for edge in edges {
+            let (from, to) = edge?;
+            adj.entry(from).or_default().insert(to);
+            adj.entry(to).or_default().insert(from);
+        }
+
+        // Compute degree stats
+        let degrees: Vec<i64> = adj
+            .values()
+            .map(|neighbors| neighbors.len() as i64)
+            .collect();
+        let max_degree = degrees.iter().copied().max().unwrap_or(0);
+        let avg_degree = if degrees.is_empty() {
+            0.0
+        } else {
+            degrees.iter().sum::<i64>() as f64 / degrees.len() as f64
+        };
+
+        // Count leaves (degree == 1)
+        let leaf_count = degrees.iter().filter(|&&d| d == 1).count() as i64;
+
+        // Find connected components using BFS
+        let mut visited: HashSet<i64> = HashSet::new();
+        let mut island_sizes: Vec<i64> = Vec::new();
+
+        for &node in adj.keys() {
+            if visited.contains(&node) {
+                continue;
+            }
+
+            // BFS to find component size
+            let mut queue = vec![node];
+            let mut component_size = 0i64;
+
+            while let Some(current) = queue.pop() {
+                if visited.contains(&current) {
+                    continue;
+                }
+                visited.insert(current);
+                component_size += 1;
+
+                if let Some(neighbors) = adj.get(&current) {
+                    for &neighbor in neighbors {
+                        if !visited.contains(&neighbor) {
+                            queue.push(neighbor);
+                        }
+                    }
+                }
+            }
+
+            island_sizes.push(component_size);
+        }
+
+        let island_count = island_sizes.len() as i64;
+        let largest_island_size = island_sizes.iter().copied().max().unwrap_or(0);
+
+        Ok(GraphStats {
+            stray_count,
+            island_count,
+            largest_island_size,
+            leaf_count,
+            max_degree,
+            avg_degree,
         })
     }
 
@@ -644,6 +737,11 @@ mod tests {
         assert_eq!(stats.max_memory_id, Some(4));
         assert_eq!(stats.unique_sources, vec!["src1", "src2"]);
 
+        // Check graph stats before relationships
+        assert_eq!(stats.graph.stray_count, 4); // all memories are stray
+        assert_eq!(stats.graph.island_count, 0); // no islands yet
+        assert_eq!(stats.graph.largest_island_size, 0);
+
         // Add relationships
         store.strengthen(&[1, 2]).unwrap();
         store.strengthen(&[1, 2, 3]).unwrap(); // adds events for (1,2), (1,3), (2,3)
@@ -651,6 +749,13 @@ mod tests {
         let stats = store.stats().unwrap();
         assert_eq!(stats.relationship_count, 3); // unique pairs: (1,2), (1,3), (2,3)
         assert_eq!(stats.relationship_event_count, 4); // 1 + 3 events
+
+        // Check graph stats after relationships
+        assert_eq!(stats.graph.stray_count, 1); // only memory 4 is stray
+        assert_eq!(stats.graph.island_count, 1); // one island (1,2,3)
+        assert_eq!(stats.graph.largest_island_size, 3);
+        assert_eq!(stats.graph.leaf_count, 0); // all have degree 2
+        assert_eq!(stats.graph.max_degree, 2);
     }
 
     #[test]

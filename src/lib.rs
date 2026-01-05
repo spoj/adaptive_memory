@@ -129,7 +129,7 @@ impl Default for SearchParams {
 
 pub use db::default_db_path;
 pub use error::MemoryError;
-pub use memory::{AddMemoryResult, Memory, Stats};
+pub use memory::{AddMemoryResult, GraphStats, Memory, Stats};
 pub use relationship::{ConnectResult, Relationship, RelationshipEvent, StrengthenResult};
 pub use search::{ActivatedMemory, SearchResult};
 pub use store::MemoryStore;
