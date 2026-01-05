@@ -2,6 +2,15 @@
 name = "adaptive_memory"
 version = "0.1.0"
 edition = "2024"
+description = "An associative memory system using spreading activation with SQLite FTS5 full-text search"
+license = "MIT"
+repository = "https://github.com/spoj/adaptive_memory"
+keywords = ["memory", "search", "sqlite", "fts5", "spreading-activation"]
+categories = ["database", "text-processing"]
+
+[lib]
+name = "adaptive_memory"
+path = "src/lib.rs"
 
 [[bin]]
 name = "adaptive-memory"

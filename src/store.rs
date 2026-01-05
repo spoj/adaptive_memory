@@ -198,6 +198,18 @@ impl MemoryStore {
         }
     }
 
+    /// Get the latest N memories, ordered by ID descending (most recent first).
+    pub fn tail(&self, n: usize) -> Result<Vec<Memory>, MemoryError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, datetime, text, source FROM memories ORDER BY id DESC LIMIT ?1")?;
+
+        let rows = stmt.query_map(params![n], |row| Self::row_to_memory(row))?;
+
+        let memories: Result<Vec<_>, _> = rows.collect();
+        Ok(memories?)
+    }
+
     /// Get multiple memories by their IDs.
     pub fn get_many(&self, ids: &[i64]) -> Result<Vec<Memory>, MemoryError> {
         if ids.is_empty() {

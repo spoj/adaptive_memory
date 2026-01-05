@@ -65,6 +65,13 @@ enum Commands {
         /// Comma-separated list of memory IDs (max 10)
         ids: String,
     },
+
+    /// Show the latest N memories
+    Tail {
+        /// Number of memories to show (default: 10)
+        #[arg(default_value_t = 10)]
+        n: usize,
+    },
 }
 
 fn main() {
@@ -124,6 +131,16 @@ fn run(command: Commands, db_path: &PathBuf) -> Result<(), Box<dyn std::error::E
             let ids = parse_ids(&ids)?;
             let mut store = MemoryStore::open(db_path)?;
             let result = store.strengthen(&ids)?;
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
+
+        Commands::Tail { n } => {
+            let store = MemoryStore::open(db_path)?;
+            let memories = store.tail(n)?;
+            let result = serde_json::json!({
+                "count": memories.len(),
+                "memories": memories
+            });
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
     }
