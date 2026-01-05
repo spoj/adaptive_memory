@@ -87,7 +87,7 @@ pub const MAX_SPREADING_ITERATIONS: usize = 5000;
 pub const MAX_STRENGTHEN_SET: usize = 10;
 
 /// Default number of results to return from search.
-pub const DEFAULT_LIMIT: usize = 100;
+pub const DEFAULT_LIMIT: usize = 50;
 
 // ============================================================================
 // Runtime Configuration
@@ -117,7 +117,7 @@ impl Default for SearchParams {
         Self {
             limit: DEFAULT_LIMIT,
             decay_factor: 0.0,
-            energy_decay: 0.5,
+            energy_decay: 0.7,
             context: 0,
         }
     }

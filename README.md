@@ -389,15 +389,15 @@ fn main() -> Result<(), MemoryError> {
 | `ENERGY_THRESHOLD` | 0.01 | Stop propagation below this energy |
 | `MAX_SPREADING_ITERATIONS` | 5000 | Safety limit on activation iterations |
 | `MAX_STRENGTHEN_SET` | 10 | Max memories per strengthen call |
-| `DEFAULT_LIMIT` | 100 | Default result limit |
+| `DEFAULT_LIMIT` | 50 | Default result limit |
 
 ### Runtime Parameters (`SearchParams`)
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `limit` | 100 | Max results (also seed count for FTS) |
+| `limit` | 50 | Max results (also seed count for FTS) |
 | `decay_factor` | 0.0 | Relationship strength decay over memory distance |
-| `energy_decay` | 0.5 | Energy multiplier per hop (0.5 = halves each hop) |
+| `energy_decay` | 0.7 | Energy multiplier per hop (0.7 = 70% retained each hop) |
 | `context` | 0 | Fetch N memories before/after each result |
 
 ### Tuning `energy_decay`
