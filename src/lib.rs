@@ -83,6 +83,10 @@ pub struct SearchParams {
     /// PPR damping factor (alpha). Classic PageRank uses 0.85.
     /// Higher values = more weight to graph structure, lower = more weight to seeds.
     pub alpha: f64,
+    /// Degree penalty exponent (beta). Penalizes high-degree nodes.
+    /// 0.0 = no penalty, 0.5 = sqrt penalty, 1.0 = linear penalty.
+    /// Higher values boost unique/rare connections over hub connections.
+    pub beta: f64,
     /// Context window: fetch N memories before/after each result (like grep -B/-A).
     /// Set to 0 to disable context expansion.
     pub context: usize,
@@ -97,6 +101,7 @@ impl Default for SearchParams {
         Self {
             limit: DEFAULT_LIMIT,
             alpha: 0.85,
+            beta: 0.5,
             context: 0,
             from: None,
             to: None,

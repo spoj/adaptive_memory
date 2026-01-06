@@ -60,6 +60,10 @@ enum Commands {
         #[arg(short, long, default_value_t = 0.85)]
         alpha: f64,
 
+        /// Degree penalty (0 = none, 0.5 = sqrt, 1.0 = linear). Boosts unique links over hubs.
+        #[arg(short, long, default_value_t = 0.5)]
+        beta: f64,
+
         /// Context window: fetch N memories before/after each result (like grep -B/-A)
         #[arg(short, long, default_value_t = 0)]
         context: usize,
@@ -163,6 +167,7 @@ fn run(command: Commands, db_path: &PathBuf) -> Result<(), Box<dyn std::error::E
             query,
             limit,
             alpha,
+            beta,
             context,
             from,
             to,
@@ -171,6 +176,7 @@ fn run(command: Commands, db_path: &PathBuf) -> Result<(), Box<dyn std::error::E
             let params = SearchParams {
                 limit,
                 alpha,
+                beta,
                 context,
                 from,
                 to,

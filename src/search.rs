@@ -41,6 +41,8 @@ struct Graph {
     edges: HashMap<i64, Vec<(i64, f64)>>,
     /// Out-degree (sum of edge weights) for each node
     out_weight: HashMap<i64, f64>,
+    /// Number of connections (edge count) for each node
+    degree: HashMap<i64, usize>,
 }
 
 impl Graph {
@@ -48,6 +50,7 @@ impl Graph {
     fn load(conn: &Connection) -> Result<Self, MemoryError> {
         let mut edges: HashMap<i64, Vec<(i64, f64)>> = HashMap::new();
         let mut out_weight: HashMap<i64, f64> = HashMap::new();
+        let mut degree: HashMap<i64, usize> = HashMap::new();
 
         // Load all relationships, aggregate by (from, to) pair
         let mut stmt = conn.prepare(
@@ -73,14 +76,22 @@ impl Graph {
             // Track out-weight for both directions
             *out_weight.entry(from).or_default() += strength;
             *out_weight.entry(to).or_default() += strength;
+
+            // Track degree (number of connections)
+            *degree.entry(from).or_default() += 1;
+            *degree.entry(to).or_default() += 1;
         }
 
-        Ok(Self { edges, out_weight })
+        Ok(Self {
+            edges,
+            out_weight,
+            degree,
+        })
     }
 
-    /// Get neighbors and their normalized transition probabilities.
-    /// Returns (neighbor_id, weight / total_out_weight).
-    fn neighbors(&self, node_id: i64) -> impl Iterator<Item = (i64, f64)> + '_ {
+    /// Get neighbors and their normalized transition probabilities with degree penalty.
+    /// Returns (neighbor_id, weight / total_out_weight, neighbor_degree).
+    fn neighbors(&self, node_id: i64) -> impl Iterator<Item = (i64, f64, usize)> + '_ {
         let total = self.out_weight.get(&node_id).copied().unwrap_or(0.0);
         self.edges
             .get(&node_id)
@@ -88,7 +99,8 @@ impl Graph {
             .flatten()
             .map(move |&(neighbor, weight)| {
                 let prob = if total > 0.0 { weight / total } else { 0.0 };
-                (neighbor, prob)
+                let neighbor_degree = self.degree.get(&neighbor).copied().unwrap_or(1);
+                (neighbor, prob, neighbor_degree)
             })
     }
 
@@ -199,13 +211,16 @@ fn get_memories_by_ids(conn: &Connection, ids: &[i64]) -> Result<Vec<Memory>, Me
     Ok(memories?)
 }
 
-/// Personalized PageRank power iteration.
+/// Personalized PageRank power iteration with degree penalty.
 ///
 /// Formula: score = (1 - α) * seed + α * P * score
 /// Where P is the transition matrix (normalized edge weights).
 ///
+/// Beta controls degree penalty: contribution is divided by neighbor_degree^beta.
+/// This boosts unique/rare connections over high-degree hub connections.
+///
 /// Dangling nodes (no outgoing edges) teleport their score back to seeds.
-fn ppr(graph: &Graph, seeds: &[(i64, f64)], alpha: f64) -> (HashMap<i64, f64>, usize) {
+fn ppr(graph: &Graph, seeds: &[(i64, f64)], alpha: f64, beta: f64) -> (HashMap<i64, f64>, usize) {
     // Normalize seed scores to sum to 1.0
     let seed_total: f64 = seeds.iter().map(|(_, s)| s).sum();
     if seed_total == 0.0 {
@@ -229,15 +244,18 @@ fn ppr(graph: &Graph, seeds: &[(i64, f64)], alpha: f64) -> (HashMap<i64, f64>, u
         // Track dangling node score (nodes with no outgoing edges)
         let mut dangling_sum = 0.0;
 
-        // Propagate: α * Σ(score[node] * transition_prob)
+        // Propagate: α * Σ(score[node] * transition_prob / neighbor_degree^beta)
         for (&node_id, &score) in &scores {
             if graph.is_dangling(node_id) {
                 // Dangling node: accumulate score for redistribution to seeds
                 dangling_sum += score;
             } else {
-                // Normal node: distribute score to neighbors
-                for (neighbor_id, prob) in graph.neighbors(node_id) {
-                    *new_scores.entry(neighbor_id).or_insert(0.0) += alpha * score * prob;
+                // Normal node: distribute score to neighbors with degree penalty
+                for (neighbor_id, prob, neighbor_degree) in graph.neighbors(node_id) {
+                    // Penalize high-degree neighbors: divide by degree^beta
+                    let degree_penalty = (neighbor_degree as f64).powf(beta);
+                    let contribution = alpha * score * prob / degree_penalty;
+                    *new_scores.entry(neighbor_id).or_insert(0.0) += contribution;
                 }
             }
         }
@@ -246,6 +264,14 @@ fn ppr(graph: &Graph, seeds: &[(i64, f64)], alpha: f64) -> (HashMap<i64, f64>, u
         // This is equivalent to dangling nodes teleporting back to seeds
         for (id, seed_score) in &seed_map {
             *new_scores.entry(*id).or_insert(0.0) += alpha * dangling_sum * seed_score;
+        }
+
+        // Renormalize to maintain probability distribution (since degree penalty breaks it)
+        let total: f64 = new_scores.values().sum();
+        if total > 0.0 {
+            for score in new_scores.values_mut() {
+                *score /= total;
+            }
         }
 
         // Check convergence (L1 norm of change)
@@ -284,8 +310,8 @@ pub(crate) fn surface_candidates(
     // Step 2: Load graph into memory
     let graph = Graph::load(conn)?;
 
-    // Step 3: Run PPR
-    let (scores, iterations) = ppr(&graph, &seeds, params.alpha);
+    // Step 3: Run PPR with degree penalty
+    let (scores, iterations) = ppr(&graph, &seeds, params.alpha, params.beta);
 
     // Step 4: Filter by ID range, sort by score, and take top `limit`
     let mut activated: Vec<(i64, f64)> = scores
