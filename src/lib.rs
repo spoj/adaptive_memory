@@ -87,7 +87,7 @@ pub const MAX_SPREADING_ITERATIONS: usize = 5000;
 pub const MAX_STRENGTHEN_SET: usize = 10;
 
 /// Default number of results to return from search.
-pub const DEFAULT_LIMIT: usize = 50;
+pub const DEFAULT_LIMIT: usize = 10;
 
 // ============================================================================
 // Runtime Configuration
@@ -110,6 +110,10 @@ pub struct SearchParams {
     /// Context window: fetch N memories before/after each result (like grep -B/-A).
     /// Set to 0 to disable context expansion.
     pub context: usize,
+    /// Filter results to memories with ID >= from (inclusive).
+    pub from: Option<i64>,
+    /// Filter results to memories with ID <= to (inclusive).
+    pub to: Option<i64>,
 }
 
 impl Default for SearchParams {
@@ -117,8 +121,10 @@ impl Default for SearchParams {
         Self {
             limit: DEFAULT_LIMIT,
             decay_factor: 0.0,
-            energy_decay: 0.7,
+            energy_decay: 0.3,
             context: 0,
+            from: None,
+            to: None,
         }
     }
 }

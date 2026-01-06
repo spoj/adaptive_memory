@@ -147,9 +147,14 @@ pub(crate) fn get_relationship<C: std::ops::Deref<Target = Connection>>(
     }
 }
 
+/// Sigmoid constant for edge strength transformation.
+/// k=1 means strength=1 gives 0.5 propagation factor.
+const SIGMOID_K: f64 = 1.0;
+
 /// Get all relationships for a memory (as either from_mem or to_mem).
-/// Returns normalized strengths per neighbor (sum to 1.0, like probabilities).
-/// This ensures energy is distributed proportionally rather than multiplied.
+/// Returns strengths transformed via sigmoid: strength / (strength + k).
+/// This ensures edges are independent (strengthening one doesn't affect others)
+/// and bounded (always < 1.0), preventing energy blowup.
 pub(crate) fn get_relationships_for_memory(
     conn: &Connection,
     mem_id: i64,
@@ -187,23 +192,14 @@ pub(crate) fn get_relationships_for_memory(
         *neighbor_raw.entry(neighbor_id).or_insert(0.0) += eff;
     }
 
-    // Apply ln_1p for diminishing returns, then normalize
-    // ln_1p(x) = ln(1+x), numerically stable for small x
-    // This compresses: 1→0.69, 10→2.40, 100→4.62
-    let mut neighbor_strengths: HashMap<i64, f64> = neighbor_raw
+    // Sigmoid transform: strength / (strength + k)
+    // - Edges are independent (strengthening one doesn't affect others)
+    // - Bounded: always < 1.0, so decay * sigmoid < decay < 1 (no blowup)
+    // - k=1: strength=1 gives 0.5, strength=10 gives 0.91
+    Ok(neighbor_raw
         .into_iter()
-        .map(|(id, raw)| (id, raw.ln_1p()))
-        .collect();
-
-    // Normalize: strengths sum to 1.0 (PageRank-style distribution)
-    let total_strength: f64 = neighbor_strengths.values().sum();
-    if total_strength > 0.0 {
-        for strength in neighbor_strengths.values_mut() {
-            *strength /= total_strength;
-        }
-    }
-
-    Ok(neighbor_strengths.into_iter().collect())
+        .map(|(id, raw)| (id, raw / (raw + SIGMOID_K)))
+        .collect())
 }
 
 #[cfg(test)]

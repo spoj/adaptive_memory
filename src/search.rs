@@ -31,7 +31,7 @@ pub struct SearchResult {
     pub total_activated: usize,
     /// Number of spreading activation iterations performed.
     pub iterations: usize,
-    /// Results sorted by memory ID (timeline order).
+    /// Results sorted by energy score (highest first).
     pub memories: Vec<ActivatedMemory>,
 }
 
@@ -239,8 +239,15 @@ pub(crate) fn surface_candidates(
         }
     }
 
-    // Step 4: Sort by energy and take top `limit`
-    let mut activated: Vec<(i64, f64)> = energy_map.into_iter().collect();
+    // Step 4: Filter by ID range, sort by energy, and take top `limit`
+    let mut activated: Vec<(i64, f64)> = energy_map
+        .into_iter()
+        .filter(|(id, _)| {
+            let above_from = params.from.map_or(true, |from| *id >= from);
+            let below_to = params.to.map_or(true, |to| *id <= to);
+            above_from && below_to
+        })
+        .collect();
     activated.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
     activated.truncate(limit);
 
@@ -290,8 +297,8 @@ pub(crate) fn surface_candidates(
         }
     }
 
-    // Sort by memory ID (timeline order)
-    results.sort_by_key(|m| m.memory.id);
+    // Sort by energy score (highest first)
+    results.sort_by(|a, b| b.energy.partial_cmp(&a.energy).unwrap_or(Ordering::Equal));
 
     Ok(SearchResult {
         query: query.to_string(),

@@ -67,6 +67,14 @@ enum Commands {
         /// Context window: fetch N memories before/after each result (like grep -B/-A)
         #[arg(short, long, default_value_t = 0)]
         context: usize,
+
+        /// Filter results to memories with ID >= from (inclusive)
+        #[arg(long)]
+        from: Option<i64>,
+
+        /// Filter results to memories with ID <= to (inclusive)
+        #[arg(long)]
+        to: Option<i64>,
     },
 
     /// Strengthen relationships between memories
@@ -161,6 +169,8 @@ fn run(command: Commands, db_path: &PathBuf) -> Result<(), Box<dyn std::error::E
             decay,
             energy_decay,
             context,
+            from,
+            to,
         } => {
             let store = MemoryStore::open(db_path)?;
             let params = SearchParams {
@@ -168,6 +178,8 @@ fn run(command: Commands, db_path: &PathBuf) -> Result<(), Box<dyn std::error::E
                 decay_factor: decay,
                 energy_decay,
                 context,
+                from,
+                to,
             };
             let result = store.search(&query, &params)?;
             println!("{}", serde_json::to_string_pretty(&result)?);
