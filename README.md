@@ -8,7 +8,7 @@ An associative memory system using spreading activation. Memories are stored in 
 Entries with `id`, `datetime`, `text`, and optional `source`. Stored in SQLite with FTS5 full-text indexing. IDs are sequential integers assigned on insertion.
 
 ### Relationships
-Symmetric connections between memories. Created only via explicit `strengthen` calls - no auto-generated relationships. Multiple strengthen events accumulate; effective strength is the sum of all events (with optional decay).
+Symmetric connections between memories. Created only via explicit `strengthen` calls - no auto-generated relationships. Multiple strengthen events accumulate; effective strength is the sum of all events.
 
 Relationships are stored canonically (`from_mem < to_mem`) as an event log. This allows strength to build up over time through repeated strengthening.
 
@@ -20,7 +20,7 @@ Search works by:
    - Energy is *distributed* across neighbors (PageRank-style normalization)
    - Each hop multiplies by `energy_decay` (default 0.5)
    - Propagation stops when energy < 0.01 threshold
-4. **Results**: Memories sorted by ID (timeline order) with accumulated energy scores
+4. **Results**: Memories sorted by energy score (highest first)
 
 ### Context Expansion
 Instead of pre-computed temporal relationships, use `--context N` to fetch N memories before/after each result by ID. This is like `grep -B/-A` for temporal context.
@@ -109,10 +109,10 @@ adaptive-memory add "Started learning Rust" -d "2023-06-15T10:00:00Z"
 adaptive-memory search [OPTIONS] <QUERY>
 
 Options:
-  -l, --limit <N>          Maximum results (default: 100)
+  -l, --limit <N>          Maximum results (default: 10)
   -c, --context <N>        Fetch N memories before/after each result (default: 0)
-  --decay <FACTOR>         Relationship decay over memory distance (default: 0)
   --energy-decay <FACTOR>  Energy multiplier per hop (default: 0.5)
+  -k <VALUE>               Sigmoid k for edge strength: strength/(strength+k) (default: 1.0)
 ```
 
 **Examples:**
@@ -156,7 +156,7 @@ adaptive-memory search "ideas" --energy-decay 0.7
 }
 ```
 
-Results are sorted by memory ID (timeline order). The `energy` field indicates relevance:
+Results are sorted by energy score (highest first). The `energy` field indicates relevance:
 - ~1.0 = direct BM25 match
 - ~0.5 = one hop from a seed
 - < 0.1 = reached via multi-hop spreading
@@ -389,15 +389,15 @@ fn main() -> Result<(), MemoryError> {
 | `ENERGY_THRESHOLD` | 0.01 | Stop propagation below this energy |
 | `MAX_SPREADING_ITERATIONS` | 5000 | Safety limit on activation iterations |
 | `MAX_STRENGTHEN_SET` | 10 | Max memories per strengthen call |
-| `DEFAULT_LIMIT` | 50 | Default result limit |
+| `DEFAULT_LIMIT` | 10 | Default result limit |
 
 ### Runtime Parameters (`SearchParams`)
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `limit` | 50 | Max results (also seed count for FTS) |
-| `decay_factor` | 0.0 | Relationship strength decay over memory distance |
-| `energy_decay` | 0.7 | Energy multiplier per hop (0.7 = 70% retained each hop) |
+| `limit` | 10 | Max results (also seed count for FTS) |
+| `energy_decay` | 0.5 | Energy multiplier per hop (0.5 = 50% retained each hop) |
+| `sigmoid_k` | 1.0 | Sigmoid k for edge strength: strength/(strength+k) |
 | `context` | 0 | Fetch N memories before/after each result |
 
 ### Tuning `energy_decay`
@@ -418,22 +418,22 @@ Hop:    0     1      2       3        4
 0.7:   1.0   0.70   0.49    0.343    0.240
 ```
 
-### Tuning `decay_factor`
+### Tuning `sigmoid_k`
 
-Controls how relationship strength fades over memory distance:
+Controls how relationship strength translates to propagation factor:
 
 ```
-effective_strength = stored_strength × exp(-distance × decay_factor)
+propagation_factor = strength / (strength + k)
 ```
 
-| Value | At 10 memories | At 50 memories | At 100 memories |
-|-------|----------------|----------------|-----------------|
-| 0.0   | 100% (no decay) | 100% | 100% |
-| 0.01  | 90% | 61% | 37% |
-| 0.03  | 74% | 22% | 5% |
-| 0.05  | 61% | 8% | 0.7% |
+| k | strength=1 | strength=2 | strength=5 | strength=10 |
+|---|------------|------------|------------|-------------|
+| 0.5 | 0.67 | 0.80 | 0.91 | 0.95 |
+| 1.0 | 0.50 | 0.67 | 0.83 | 0.91 |
+| 2.0 | 0.33 | 0.50 | 0.71 | 0.83 |
+| 5.0 | 0.17 | 0.29 | 0.50 | 0.67 |
 
-Default is 0.0 (no decay). The ln_1p compression and PageRank-style normalization already prevent old relationships from dominating.
+Lower k = stronger edges propagate more energy. Higher k = requires more strengthening to achieve high propagation.
 
 ## Database Schema
 

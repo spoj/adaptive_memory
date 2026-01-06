@@ -171,7 +171,6 @@ pub(crate) fn surface_candidates(
     conn: &Connection,
     query: &str,
     params: &SearchParams,
-    current_max_mem: i64,
 ) -> Result<SearchResult, MemoryError> {
     let limit = params.limit;
 
@@ -223,8 +222,7 @@ pub(crate) fn surface_candidates(
             propagated_energy.insert(item.mem_id, *total);
 
             // Get neighbors with their effective strengths (using runtime weights)
-            let neighbors =
-                get_relationships_for_memory(conn, item.mem_id, current_max_mem, params)?;
+            let neighbors = get_relationships_for_memory(conn, item.mem_id, params)?;
 
             for (neighbor_id, effective_strength) in neighbors {
                 let new_energy = to_propagate * params.energy_decay * effective_strength;

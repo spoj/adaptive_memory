@@ -10,6 +10,52 @@ pub fn default_db_path() -> PathBuf {
         .join(".adaptive_memory.db")
 }
 
+/// Migrate relationships table to remove created_at_mem column.
+fn migrate_relationships_v2(conn: &Connection) -> Result<()> {
+    // Check if old schema exists (has created_at_mem column)
+    let has_old_schema: bool = conn
+        .prepare("SELECT created_at_mem FROM relationships LIMIT 1")
+        .is_ok();
+
+    if !has_old_schema {
+        return Ok(());
+    }
+
+    // Check if table has any data
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM relationships", [], |r| r.get(0))?;
+    if count == 0 {
+        // Empty table - just drop and recreate
+        conn.execute("DROP TABLE relationships", [])?;
+        return Ok(());
+    }
+
+    // Migrate: create new table, copy data, swap
+    conn.execute_batch(
+        "
+        CREATE TABLE relationships_new (
+            id INTEGER PRIMARY KEY,
+            from_mem INTEGER NOT NULL,
+            to_mem INTEGER NOT NULL,
+            strength REAL NOT NULL,
+            CHECK (from_mem < to_mem),
+            FOREIGN KEY (from_mem) REFERENCES memories(id),
+            FOREIGN KEY (to_mem) REFERENCES memories(id)
+        );
+
+        INSERT INTO relationships_new (id, from_mem, to_mem, strength)
+        SELECT id, from_mem, to_mem, strength FROM relationships;
+
+        DROP TABLE relationships;
+        ALTER TABLE relationships_new RENAME TO relationships;
+
+        CREATE INDEX idx_rel_from ON relationships(from_mem);
+        CREATE INDEX idx_rel_to ON relationships(to_mem);
+        ",
+    )?;
+
+    Ok(())
+}
+
 /// Initialize the database schema.
 pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
     // Enable foreign keys
@@ -54,15 +100,17 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
         ",
     )?;
 
+    // Migrate old schema if needed (remove created_at_mem column)
+    migrate_relationships_v2(conn)?;
+
     // Create relationships table (event log style - multiple rows per pair allowed)
     // from_mem < to_mem enforces canonical ordering for symmetric relationships
-    // Each row represents a strengthening event; effective strength is sum of decayed rows
+    // Each row represents a strengthening event; effective strength is sum of rows
     conn.execute(
         "CREATE TABLE IF NOT EXISTS relationships (
             id INTEGER PRIMARY KEY,
             from_mem INTEGER NOT NULL,
             to_mem INTEGER NOT NULL,
-            created_at_mem INTEGER NOT NULL,
             strength REAL NOT NULL,
             CHECK (from_mem < to_mem),
             FOREIGN KEY (from_mem) REFERENCES memories(id),
@@ -84,7 +132,7 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Get the current maximum memory ID (used for decay calculations).
+/// Get the current maximum memory ID (used for relationship event timestamps).
 pub(crate) fn get_max_memory_id(conn: &Connection) -> Result<i64> {
     conn.query_row("SELECT COALESCE(MAX(id), 0) FROM memories", [], |row| {
         row.get(0)

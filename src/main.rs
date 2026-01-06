@@ -56,13 +56,13 @@ enum Commands {
         #[arg(short, long, default_value_t = DEFAULT_LIMIT)]
         limit: usize,
 
-        /// Decay factor for relationship strength over memory distance (0 = no decay)
-        #[arg(long, default_value_t = 0.0)]
-        decay: f64,
-
         /// Energy decay per hop during spreading activation
         #[arg(long, default_value_t = 0.5)]
         energy_decay: f64,
+
+        /// Sigmoid k parameter for edge strength transformation (strength / (strength + k))
+        #[arg(short, long, default_value_t = 1.0)]
+        k: f64,
 
         /// Context window: fetch N memories before/after each result (like grep -B/-A)
         #[arg(short, long, default_value_t = 0)]
@@ -166,8 +166,8 @@ fn run(command: Commands, db_path: &PathBuf) -> Result<(), Box<dyn std::error::E
         Commands::Search {
             query,
             limit,
-            decay,
             energy_decay,
+            k,
             context,
             from,
             to,
@@ -175,8 +175,8 @@ fn run(command: Commands, db_path: &PathBuf) -> Result<(), Box<dyn std::error::E
             let store = MemoryStore::open(db_path)?;
             let params = SearchParams {
                 limit,
-                decay_factor: decay,
                 energy_decay,
+                sigmoid_k: k,
                 context,
                 from,
                 to,

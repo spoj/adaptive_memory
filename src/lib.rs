@@ -1,6 +1,6 @@
 //! Adaptive Memory System
 //!
-//! A spreading activation memory system with decay-based relationship strength.
+//! A spreading activation memory system with configurable relationship strength.
 //!
 //! # Example
 //!
@@ -101,12 +101,12 @@ pub const DEFAULT_LIMIT: usize = 10;
 pub struct SearchParams {
     /// Maximum number of results to return (also used as seed count).
     pub limit: usize,
-    /// Decay factor for relationship strength over memory distance.
-    /// Higher = faster decay. With 0.03: ~74% at 10 memories, ~22% at 50.
-    pub decay_factor: f64,
     /// Energy decay per hop during spreading activation.
     /// 0.5 means energy halves each hop.
     pub energy_decay: f64,
+    /// Sigmoid k parameter for edge strength transformation.
+    /// Formula: strength / (strength + k). k=1 means strength=1 gives 0.5.
+    pub sigmoid_k: f64,
     /// Context window: fetch N memories before/after each result (like grep -B/-A).
     /// Set to 0 to disable context expansion.
     pub context: usize,
@@ -120,8 +120,8 @@ impl Default for SearchParams {
     fn default() -> Self {
         Self {
             limit: DEFAULT_LIMIT,
-            decay_factor: 0.0,
             energy_decay: 0.3,
+            sigmoid_k: 1.0,
             context: 0,
             from: None,
             to: None,

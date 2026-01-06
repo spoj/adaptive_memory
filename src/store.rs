@@ -18,8 +18,8 @@ use crate::{MAX_STRENGTHEN_SET, SearchParams};
 /// The main interface for the adaptive memory system.
 ///
 /// Wraps a SQLite connection and provides methods for adding, searching,
-/// and strengthening memories. Caches the maximum memory ID for efficient
-/// decay calculations.
+/// and strengthening memories. Caches the maximum memory ID for relationship
+/// event timestamps.
 pub struct MemoryStore {
     conn: Connection,
     cached_max_mem: i64,
@@ -163,7 +163,7 @@ impl MemoryStore {
     ///
     /// If the query is empty, returns the most recent memories.
     pub fn search(&self, query: &str, params: &SearchParams) -> Result<SearchResult, MemoryError> {
-        surface_candidates(&self.conn, query, params, self.cached_max_mem)
+        surface_candidates(&self.conn, query, params)
     }
 
     /// Strengthen relationships between a set of memory IDs.
@@ -199,23 +199,17 @@ impl MemoryStore {
         let mut relationships = Vec::new();
         let mut event_count = 0;
 
-        // Use default params for reading back relationships
-        // (the effective_strength shown is just for display, doesn't affect storage)
-        let default_params = SearchParams::default();
-
         // Generate all pairs and add a new event for each (1.0 strength per pair)
         for i in 0..ids.len() {
             for j in (i + 1)..ids.len() {
                 let (from_mem, to_mem) = canonicalize(ids[i], ids[j]);
 
                 // Add new relationship event with 1.0 strength
-                add_relationship_event(&tx, from_mem, to_mem, self.cached_max_mem, 1.0)?;
+                add_relationship_event(&tx, from_mem, to_mem, 1.0)?;
                 event_count += 1;
 
                 // Get the aggregated relationship (including the new event)
-                if let Some(rel) =
-                    get_relationship(&tx, from_mem, to_mem, self.cached_max_mem, &default_params)?
-                {
+                if let Some(rel) = get_relationship(&tx, from_mem, to_mem)? {
                     relationships.push(rel);
                 }
             }
@@ -255,8 +249,6 @@ impl MemoryStore {
         let mut created = Vec::new();
         let mut skipped = Vec::new();
 
-        let default_params = SearchParams::default();
-
         // Generate all pairs and only add if no existing connection
         for i in 0..ids.len() {
             for j in (i + 1)..ids.len() {
@@ -266,15 +258,9 @@ impl MemoryStore {
                     skipped.push((from_mem, to_mem));
                 } else {
                     // Create new relationship with strength 1.0
-                    add_relationship_event(&tx, from_mem, to_mem, self.cached_max_mem, 1.0)?;
+                    add_relationship_event(&tx, from_mem, to_mem, 1.0)?;
 
-                    if let Some(rel) = get_relationship(
-                        &tx,
-                        from_mem,
-                        to_mem,
-                        self.cached_max_mem,
-                        &default_params,
-                    )? {
+                    if let Some(rel) = get_relationship(&tx, from_mem, to_mem)? {
                         created.push(rel);
                     }
                 }
