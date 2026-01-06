@@ -397,7 +397,7 @@ fn main() -> Result<(), MemoryError> {
 |-----------|---------|-------------|
 | `limit` | 10 | Max results (also seed count for FTS) |
 | `energy_decay` | 0.5 | Energy multiplier per hop (0.5 = 50% retained each hop) |
-| `sigmoid_k` | 1.0 | Sigmoid k for edge strength: strength/(strength+k) |
+| `sigmoid_k` | 3.0 | Sigmoid k for edge strength: strength/(strength+k) |
 | `context` | 0 | Fetch N memories before/after each result |
 
 ### Tuning `energy_decay`

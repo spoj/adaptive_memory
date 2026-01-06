@@ -120,8 +120,8 @@ impl Default for SearchParams {
     fn default() -> Self {
         Self {
             limit: DEFAULT_LIMIT,
-            energy_decay: 0.3,
-            sigmoid_k: 1.0,
+            energy_decay: 0.5,
+            sigmoid_k: 3.0,
             context: 0,
             from: None,
             to: None,

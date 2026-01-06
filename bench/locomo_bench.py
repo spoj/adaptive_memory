@@ -36,7 +36,7 @@ MAX_RETRIES = 3
 RETRY_DELAY = 5  # seconds
 RETRIEVAL_LIMIT = 20
 CONTEXT_WINDOW = 0
-ENERGY_DECAY = 0.7  # Default spreading decay
+ENERGY_DECAY = 0.5  # Default spreading decay
 
 # --- Category names ---
 
