@@ -1,6 +1,6 @@
 # Adaptive Memory
 
-An associative memory system using spreading activation. Memories are stored in SQLite with FTS5 full-text search, and retrieved using BM25 text matching combined with graph-based activation spreading through explicit relationships.
+An associative memory system using Personalized PageRank (PPR). Memories are stored in SQLite with FTS5 full-text search, and retrieved using BM25 text matching combined with PPR graph-based ranking through explicit relationships.
 
 ## Core Concepts
 
@@ -12,15 +12,16 @@ Symmetric connections between memories. Created only via explicit `strengthen` c
 
 Relationships are stored canonically (`from_mem < to_mem`) as an event log. This allows strength to build up over time through repeated strengthening.
 
-### Spreading Activation
+### Personalized PageRank (PPR)
 Search works by:
 1. **FTS5 Search**: Find memories matching query using BM25 ranking
-2. **Seed Selection**: Top BM25 results become seeds with energy 0.1-1.0 (proportional to relevance)
-3. **Energy Propagation**: Energy spreads through relationship graph
-   - Energy is *distributed* across neighbors (PageRank-style normalization)
-   - Each hop multiplies by `energy_decay` (default 0.5)
-   - Propagation stops when energy < 0.01 threshold
-4. **Results**: Memories sorted by energy score (highest first)
+2. **Seed Selection**: Top BM25 results become seeds (normalized to sum to 1.0)
+3. **PPR Power Iteration**: Classic PageRank with personalization
+   - `score = (1 - α) * seed + α * P * score` where P is transition matrix
+   - Edge weights (relationship strength) determine transition probabilities
+   - Dangling nodes (no connections) teleport back to seeds
+   - Converges in ~20-50 iterations (max 100)
+4. **Results**: Memories sorted by PPR score (highest first)
 
 ### Context Expansion
 Instead of pre-computed temporal relationships, use `--context N` to fetch N memories before/after each result by ID. This is like `grep -B/-A` for temporal context.
@@ -109,10 +110,9 @@ adaptive-memory add "Started learning Rust" -d "2023-06-15T10:00:00Z"
 adaptive-memory search [OPTIONS] <QUERY>
 
 Options:
-  -l, --limit <N>          Maximum results (default: 10)
-  -c, --context <N>        Fetch N memories before/after each result (default: 0)
-  --energy-decay <FACTOR>  Energy multiplier per hop (default: 0.5)
-  -k <VALUE>               Sigmoid k for edge strength: strength/(strength+k) (default: 1.0)
+  -l, --limit <N>      Maximum results (default: 10)
+  -c, --context <N>    Fetch N memories before/after each result (default: 0)
+  -a, --alpha <VALUE>  PPR damping factor (default: 0.85, lower = more weight to text matches)
 ```
 
 **Examples:**
@@ -126,8 +126,8 @@ adaptive-memory search "rust" --context 2
 # Limit results
 adaptive-memory search "database" --limit 10
 
-# Deeper activation spread (reach more distant associations)
-adaptive-memory search "ideas" --energy-decay 0.7
+# More weight to text matches (less graph influence)
+adaptive-memory search "ideas" --alpha 0.5
 ```
 
 **Output:**
@@ -156,10 +156,7 @@ adaptive-memory search "ideas" --energy-decay 0.7
 }
 ```
 
-Results are sorted by energy score (highest first). The `energy` field indicates relevance:
-- ~1.0 = direct BM25 match
-- ~0.5 = one hop from a seed
-- < 0.1 = reached via multi-hop spreading
+Results are sorted by PPR score (highest first). The `energy` field indicates relevance (PPR scores sum to 1.0 across all activated nodes).
 
 Context items (from `--context`) have `energy: 0.0` and `is_context: true`.
 
@@ -386,8 +383,8 @@ fn main() -> Result<(), MemoryError> {
 
 | Constant | Default | Description |
 |----------|---------|-------------|
-| `ENERGY_THRESHOLD` | 0.01 | Stop propagation below this energy |
-| `MAX_SPREADING_ITERATIONS` | 5000 | Safety limit on activation iterations |
+| `PPR_EPSILON` | 1e-6 | Convergence threshold for PPR iteration |
+| `PPR_MAX_ITER` | 100 | Maximum PPR iterations |
 | `MAX_STRENGTHEN_SET` | 10 | Max memories per strengthen call |
 | `DEFAULT_LIMIT` | 10 | Default result limit |
 
@@ -396,44 +393,22 @@ fn main() -> Result<(), MemoryError> {
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `limit` | 10 | Max results (also seed count for FTS) |
-| `energy_decay` | 0.5 | Energy multiplier per hop (0.5 = 50% retained each hop) |
-| `sigmoid_k` | 3.0 | Sigmoid k for edge strength: strength/(strength+k) |
+| `alpha` | 0.85 | PPR damping factor (classic PageRank value) |
 | `context` | 0 | Fetch N memories before/after each result |
 
-### Tuning `energy_decay`
+### Tuning `alpha` (Damping Factor)
 
-Controls how far activation spreads through the graph:
+Controls the balance between text matches (seeds) and graph structure:
 
-| Value | Behavior | Max Depth |
-|-------|----------|-----------|
-| 0.3 | Shallow spread, stick close to seeds | ~4 hops |
-| 0.5 | Balanced (default) | ~7 hops |
-| 0.7 | Deep spread, reach distant associations | ~12 hops |
+| Value | Behavior |
+|-------|----------|
+| 0.5 | More weight to text matches, less graph exploration |
+| 0.85 | Classic PageRank balance (default) |
+| 0.95 | More weight to graph structure, deeper exploration |
 
-Energy at each hop (starting from seed with energy 1.0):
-
-```
-Hop:    0     1      2       3        4
-0.5:   1.0   0.50   0.25    0.125    0.0625
-0.7:   1.0   0.70   0.49    0.343    0.240
-```
-
-### Tuning `sigmoid_k`
-
-Controls how relationship strength translates to propagation factor:
-
-```
-propagation_factor = strength / (strength + k)
-```
-
-| k | strength=1 | strength=2 | strength=5 | strength=10 |
-|---|------------|------------|------------|-------------|
-| 0.5 | 0.67 | 0.80 | 0.91 | 0.95 |
-| 1.0 | 0.50 | 0.67 | 0.83 | 0.91 |
-| 2.0 | 0.33 | 0.50 | 0.71 | 0.83 |
-| 5.0 | 0.17 | 0.29 | 0.50 | 0.67 |
-
-Lower k = stronger edges propagate more energy. Higher k = requires more strengthening to achieve high propagation.
+The PPR formula is: `score = (1 - α) * seed + α * P * score`
+- Lower α → higher `(1 - α)` → seeds dominate
+- Higher α → more propagation through graph
 
 ## Database Schema
 
@@ -465,19 +440,19 @@ CREATE TABLE relationships (
 3. No relationships created (use `strengthen` or `--context` for associations)
 
 ### Searching
-1. **FTS5**: BM25-ranked text matches become seeds
-2. **Spreading Activation**:
-   - Seeds get energy proportional to BM25 score
-   - Energy spreads through relationships (delta propagation)
-   - Neighbors' strengths are normalized (sum to 1.0) - energy is distributed, not amplified
-   - Raw strength is compressed via `ln(1+x)` for diminishing returns
+1. **FTS5**: BM25-ranked text matches become seeds (normalized to sum to 1.0)
+2. **PPR Power Iteration**:
+   - `score = (1 - α) * seed + α * P * score`
+   - P is transition matrix from relationship strengths (normalized by out-degree)
+   - Dangling nodes teleport back to seeds
+   - Iterates until convergence (L1 diff < 1e-6) or max 100 iterations
 3. **Context Expansion**: Optionally fetch surrounding memories by ID
-4. **Results**: Sorted by memory ID (timeline order)
+4. **Results**: Sorted by PPR score (highest first)
 
 ### Strengthening
 1. For each pair of IDs, add relationship event with strength 1.0
 2. Events accumulate - the pair's effective strength grows with repeated strengthening
-3. ln_1p compression means: 1st event → 0.69 effective, 10 events → 2.40, 100 events → 4.62
+3. Higher strength → higher transition probability in PPR (normalized by out-degree)
 
 ## Tips
 

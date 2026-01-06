@@ -9,7 +9,7 @@ use adaptive_memory::{
 
 #[derive(Parser)]
 #[command(name = "adaptive-memory")]
-#[command(about = "Adaptive memory system with spreading activation", long_about = None)]
+#[command(about = "Adaptive memory system with Personalized PageRank", long_about = None)]
 struct Cli {
     /// Path to the database file (default: ~/.adaptive_memory.db)
     #[arg(long, global = true)]
@@ -47,7 +47,7 @@ enum Commands {
         text: String,
     },
 
-    /// Search for memories using text query and spreading activation
+    /// Search for memories using text query and Personalized PageRank
     Search {
         /// Search query (required, cannot be empty)
         query: String,
@@ -56,13 +56,9 @@ enum Commands {
         #[arg(short, long, default_value_t = DEFAULT_LIMIT)]
         limit: usize,
 
-        /// Energy decay per hop during spreading activation
-        #[arg(long, default_value_t = 0.5)]
-        energy_decay: f64,
-
-        /// Sigmoid k parameter for edge strength transformation (strength / (strength + k))
-        #[arg(short, long, default_value_t = 1.0)]
-        k: f64,
+        /// PPR damping factor (0.85 = classic PageRank, lower = more weight to text matches)
+        #[arg(short, long, default_value_t = 0.85)]
+        alpha: f64,
 
         /// Context window: fetch N memories before/after each result (like grep -B/-A)
         #[arg(short, long, default_value_t = 0)]
@@ -166,8 +162,7 @@ fn run(command: Commands, db_path: &PathBuf) -> Result<(), Box<dyn std::error::E
         Commands::Search {
             query,
             limit,
-            energy_decay,
-            k,
+            alpha,
             context,
             from,
             to,
@@ -175,8 +170,7 @@ fn run(command: Commands, db_path: &PathBuf) -> Result<(), Box<dyn std::error::E
             let store = MemoryStore::open(db_path)?;
             let params = SearchParams {
                 limit,
-                energy_decay,
-                sigmoid_k: k,
+                alpha,
                 context,
                 from,
                 to,

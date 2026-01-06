@@ -1,6 +1,6 @@
 //! Adaptive Memory System
 //!
-//! A spreading activation memory system with configurable relationship strength.
+//! A Personalized PageRank (PPR) based memory system with relationship strength.
 //!
 //! # Example
 //!
@@ -40,48 +40,27 @@ use serde::{Deserialize, Serialize};
 // Configuration Constants
 // ============================================================================
 //
-// ## Retrieval Bounds Documentation
+// ## PPR Configuration
 //
-// These constants create artificial bounds during retrieval. Analysis of why each is acceptable:
+// ### PPR_EPSILON (1e-6)
+// Convergence threshold for PPR power iteration. When L1 norm of score change
+// falls below this, we've converged.
 //
-// ### ENERGY_THRESHOLD (0.01)
-// Energy below 1% is not propagated. With energy_decay=0.5, this means ~7 hops max depth.
-// Delta propagation accumulates all incoming energy before checking threshold, so weak paths
-// that converge are handled correctly. Natural convergence criterion.
+// ### PPR_MAX_ITER (100)
+// Maximum PPR iterations. Typical convergence is 20-50 iterations.
 //
-// ### MAX_SPREADING_ITERATIONS (5000)
-// Safety cap for dense graphs. We process highest-energy items first (max-heap), so most
-// relevant are processed even if cap is hit. Output includes `iterations` count so callers
-// know if cap was reached. Could truncate results on very dense graphs (80k+ relationships).
-//
-// ### FTS limit (SearchParams.limit, default 100)
-// Only top N BM25 matches become seeds. User-configurable via --limit. Standard practice.
-//
-// ### BM25 normalization floor (0.1 in search.rs)
-// Worst FTS match gets 10% seed energy, best gets 100%. Ensures all matches contribute.
-//
-// ### Result truncation (SearchParams.limit)
-// Final results truncated to limit after sorting by energy. Expected behavior.
-//
-// ### Bidirectional relationships and loops
-// Relationships are symmetric (A↔B). Energy can bounce A→B→A but delta propagation handles
-// this correctly - each round trip decays by (energy_decay * strength)^2, converging in
-// ~4-5 iterations for a simple loop. ENERGY_THRESHOLD catches convergence naturally.
-// MAX_SPREADING_ITERATIONS is safety valve, not loop prevention.
+// ### FTS limit (SearchParams.limit, default 10)
+// Only top N BM25 matches become seeds. User-configurable via --limit.
 //
 // ### Context expansion (--context N)
-// Instead of pre-computed temporal relationships, context is fetched at query time.
-// For each result, we can optionally fetch N memories before/after by ID.
+// For each result, optionally fetch N memories before/after by ID.
 // This is like grep -B/-A for temporal context.
 
-/// Minimum energy threshold to continue propagation.
-/// At 0.01 (1% of initial seed energy), with energy_decay=0.5, this allows ~7 hops depth.
-pub const ENERGY_THRESHOLD: f64 = 0.01;
+/// Convergence threshold for PPR power iteration (L1 norm).
+pub const PPR_EPSILON: f64 = 1e-6;
 
-/// Maximum iterations for spreading activation (prevents runaway on dense graphs).
-/// With delta propagation, typical searches use 50-300 iterations. This is a safety cap.
-/// If hit, highest-energy paths are still processed (max-heap ordering).
-pub const MAX_SPREADING_ITERATIONS: usize = 5000;
+/// Maximum iterations for PPR power iteration.
+pub const PPR_MAX_ITER: usize = 100;
 
 /// Maximum number of memories that can be strengthened at once.
 pub const MAX_STRENGTHEN_SET: usize = 10;
@@ -95,18 +74,15 @@ pub const DEFAULT_LIMIT: usize = 10;
 
 /// Runtime search parameters.
 ///
-/// All weights and decay factors are configurable at search time,
+/// All parameters are configurable at search time,
 /// allowing experimentation without recompiling.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchParams {
     /// Maximum number of results to return (also used as seed count).
     pub limit: usize,
-    /// Energy decay per hop during spreading activation.
-    /// 0.5 means energy halves each hop.
-    pub energy_decay: f64,
-    /// Sigmoid k parameter for edge strength transformation.
-    /// Formula: strength / (strength + k). k=1 means strength=1 gives 0.5.
-    pub sigmoid_k: f64,
+    /// PPR damping factor (alpha). Classic PageRank uses 0.85.
+    /// Higher values = more weight to graph structure, lower = more weight to seeds.
+    pub alpha: f64,
     /// Context window: fetch N memories before/after each result (like grep -B/-A).
     /// Set to 0 to disable context expansion.
     pub context: usize,
@@ -120,8 +96,7 @@ impl Default for SearchParams {
     fn default() -> Self {
         Self {
             limit: DEFAULT_LIMIT,
-            energy_decay: 0.5,
-            sigmoid_k: 3.0,
+            alpha: 0.85,
             context: 0,
             from: None,
             to: None,

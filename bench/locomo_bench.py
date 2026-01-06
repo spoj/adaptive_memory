@@ -36,7 +36,7 @@ MAX_RETRIES = 3
 RETRY_DELAY = 5  # seconds
 RETRIEVAL_LIMIT = 20
 CONTEXT_WINDOW = 0
-ENERGY_DECAY = 0.5  # Default spreading decay
+ALPHA = 0.85  # PPR damping factor
 
 # --- Category names ---
 
@@ -529,8 +529,8 @@ def multi_search(db_path: str, queries: list, limit: int = 15) -> list:
             str(limit),
             "-c",
             str(CONTEXT_WINDOW),
-            "--energy-decay",
-            str(ENERGY_DECAY),
+            "--alpha",
+            str(ALPHA),
         )
         try:
             memories = json.loads(result).get("memories", [])
@@ -562,8 +562,8 @@ def answer_question(db_path: str, question: str, mode: str, model: str = None) -
         str(RETRIEVAL_LIMIT),
         "-c",
         str(CONTEXT_WINDOW),
-        "--energy-decay",
-        str(ENERGY_DECAY),
+        "--alpha",
+        str(ALPHA),
     )
     try:
         memories = json.loads(result).get("memories", [])

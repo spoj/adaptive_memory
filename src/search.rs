@@ -1,22 +1,21 @@
-//! Search functionality with spreading activation.
+//! Search functionality with Personalized PageRank (PPR).
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 
 use rusqlite::{Connection, params};
 use serde::Serialize;
 
 use crate::error::MemoryError;
 use crate::memory::Memory;
-use crate::relationship::get_relationships_for_memory;
-use crate::{ENERGY_THRESHOLD, MAX_SPREADING_ITERATIONS, SearchParams};
+use crate::{PPR_EPSILON, PPR_MAX_ITER, SearchParams};
 
-/// A memory with its activation energy.
+/// A memory with its PPR score.
 #[derive(Debug, Serialize)]
 pub struct ActivatedMemory {
     #[serde(flatten)]
     pub memory: Memory,
-    /// Energy from spreading activation. 0.0 for context items.
+    /// PPR score. 0.0 for context items.
     pub energy: f64,
     /// True if this is a context item (fetched via --context, not by relevance).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -29,39 +28,73 @@ pub struct SearchResult {
     pub query: String,
     pub seed_count: usize,
     pub total_activated: usize,
-    /// Number of spreading activation iterations performed.
+    /// Number of PPR iterations performed.
     pub iterations: usize,
-    /// Results sorted by energy score (highest first).
+    /// Results sorted by PPR score (highest first).
     pub memories: Vec<ActivatedMemory>,
 }
 
-/// Item for the priority queue (max-heap by energy).
-#[derive(Debug, Clone)]
-struct ActivationItem {
-    energy: f64,
-    mem_id: i64,
+/// In-memory graph representation for PPR computation.
+/// Loaded once per search, used for all iterations.
+struct Graph {
+    /// Adjacency list: node_id -> Vec<(neighbor_id, edge_weight)>
+    edges: HashMap<i64, Vec<(i64, f64)>>,
+    /// Out-degree (sum of edge weights) for each node
+    out_weight: HashMap<i64, f64>,
 }
 
-impl PartialEq for ActivationItem {
-    fn eq(&self, other: &Self) -> bool {
-        self.mem_id == other.mem_id
+impl Graph {
+    /// Load entire graph from database.
+    fn load(conn: &Connection) -> Result<Self, MemoryError> {
+        let mut edges: HashMap<i64, Vec<(i64, f64)>> = HashMap::new();
+        let mut out_weight: HashMap<i64, f64> = HashMap::new();
+
+        // Load all relationships, aggregate by (from, to) pair
+        let mut stmt = conn.prepare(
+            "SELECT from_mem, to_mem, SUM(strength) as total_strength
+             FROM relationships
+             GROUP BY from_mem, to_mem",
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            let from: i64 = row.get(0)?;
+            let to: i64 = row.get(1)?;
+            let strength: f64 = row.get(2)?;
+            Ok((from, to, strength))
+        })?;
+
+        for row in rows {
+            let (from, to, strength) = row?;
+
+            // Bidirectional: add edge in both directions
+            edges.entry(from).or_default().push((to, strength));
+            edges.entry(to).or_default().push((from, strength));
+
+            // Track out-weight for both directions
+            *out_weight.entry(from).or_default() += strength;
+            *out_weight.entry(to).or_default() += strength;
+        }
+
+        Ok(Self { edges, out_weight })
     }
-}
 
-impl Eq for ActivationItem {}
-
-impl PartialOrd for ActivationItem {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
+    /// Get neighbors and their normalized transition probabilities.
+    /// Returns (neighbor_id, weight / total_out_weight).
+    fn neighbors(&self, node_id: i64) -> impl Iterator<Item = (i64, f64)> + '_ {
+        let total = self.out_weight.get(&node_id).copied().unwrap_or(0.0);
+        self.edges
+            .get(&node_id)
+            .into_iter()
+            .flatten()
+            .map(move |&(neighbor, weight)| {
+                let prob = if total > 0.0 { weight / total } else { 0.0 };
+                (neighbor, prob)
+            })
     }
-}
 
-impl Ord for ActivationItem {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // Reverse order for max-heap (higher energy first)
-        self.energy
-            .partial_cmp(&other.energy)
-            .unwrap_or(Ordering::Equal)
+    /// Check if a node is dangling (no outgoing edges).
+    fn is_dangling(&self, node_id: i64) -> bool {
+        self.out_weight.get(&node_id).copied().unwrap_or(0.0) == 0.0
     }
 }
 
@@ -166,7 +199,77 @@ fn get_memories_by_ids(conn: &Connection, ids: &[i64]) -> Result<Vec<Memory>, Me
     Ok(memories?)
 }
 
-/// Surface candidate memories using text search + spreading activation.
+/// Personalized PageRank power iteration.
+///
+/// Formula: score = (1 - α) * seed + α * P * score
+/// Where P is the transition matrix (normalized edge weights).
+///
+/// Dangling nodes (no outgoing edges) teleport their score back to seeds.
+fn ppr(graph: &Graph, seeds: &[(i64, f64)], alpha: f64) -> (HashMap<i64, f64>, usize) {
+    // Normalize seed scores to sum to 1.0
+    let seed_total: f64 = seeds.iter().map(|(_, s)| s).sum();
+    if seed_total == 0.0 {
+        return (HashMap::new(), 0);
+    }
+
+    let seed_map: HashMap<i64, f64> = seeds.iter().map(|(id, s)| (*id, s / seed_total)).collect();
+
+    let mut scores = seed_map.clone();
+    let mut iterations = 0;
+
+    for iter in 0..PPR_MAX_ITER {
+        iterations = iter + 1;
+        let mut new_scores: HashMap<i64, f64> = HashMap::new();
+
+        // Teleport component: (1 - α) * seed_score for each seed
+        for (id, seed_score) in &seed_map {
+            *new_scores.entry(*id).or_insert(0.0) += (1.0 - alpha) * seed_score;
+        }
+
+        // Track dangling node score (nodes with no outgoing edges)
+        let mut dangling_sum = 0.0;
+
+        // Propagate: α * Σ(score[node] * transition_prob)
+        for (&node_id, &score) in &scores {
+            if graph.is_dangling(node_id) {
+                // Dangling node: accumulate score for redistribution to seeds
+                dangling_sum += score;
+            } else {
+                // Normal node: distribute score to neighbors
+                for (neighbor_id, prob) in graph.neighbors(node_id) {
+                    *new_scores.entry(neighbor_id).or_insert(0.0) += alpha * score * prob;
+                }
+            }
+        }
+
+        // Redistribute dangling score to seeds (proportional to seed weights)
+        // This is equivalent to dangling nodes teleporting back to seeds
+        for (id, seed_score) in &seed_map {
+            *new_scores.entry(*id).or_insert(0.0) += alpha * dangling_sum * seed_score;
+        }
+
+        // Check convergence (L1 norm of change)
+        let diff: f64 = new_scores
+            .iter()
+            .map(|(id, &s)| (s - scores.get(id).unwrap_or(&0.0)).abs())
+            .sum::<f64>()
+            + scores
+                .iter()
+                .filter(|(id, _)| !new_scores.contains_key(id))
+                .map(|(_, &s)| s)
+                .sum::<f64>();
+
+        scores = new_scores;
+
+        if diff < PPR_EPSILON {
+            break;
+        }
+    }
+
+    (scores, iterations)
+}
+
+/// Surface candidate memories using text search + Personalized PageRank.
 pub(crate) fn surface_candidates(
     conn: &Connection,
     query: &str,
@@ -175,70 +278,17 @@ pub(crate) fn surface_candidates(
     let limit = params.limit;
 
     // Step 1: FTS5 search to get initial candidates with BM25 scores
-    // Seeds are selected purely by BM25 relevance (no recency re-ranking)
     let seeds = fts_search(conn, query, limit)?;
-
-    // No padding with recent memories - only use FTS matches as seeds
-
     let seed_count = seeds.len();
 
-    // Step 3: Spreading activation with delta propagation
-    //
-    // This implements theoretically correct energy superposition:
-    // - Energy accumulates from ALL paths to a node
-    // - We only propagate the DELTA (new energy) to avoid redundant work
-    // - This gives correct results while being efficient
-    let mut energy_map: HashMap<i64, f64> = HashMap::new();
-    let mut heap: BinaryHeap<ActivationItem> = BinaryHeap::new();
-    // Track how much energy we've already propagated FROM each node
-    let mut propagated_energy: HashMap<i64, f64> = HashMap::new();
+    // Step 2: Load graph into memory
+    let graph = Graph::load(conn)?;
 
-    // Initialize seeds with BM25-weighted energy
-    for (seed_id, bm25_score) in &seeds {
-        heap.push(ActivationItem {
-            energy: *bm25_score,
-            mem_id: *seed_id,
-        });
-    }
+    // Step 3: Run PPR
+    let (scores, iterations) = ppr(&graph, &seeds, params.alpha);
 
-    // Process activation spread with iteration cap
-    let mut iterations = 0;
-    while let Some(item) = heap.pop() {
-        iterations += 1;
-        if iterations > MAX_SPREADING_ITERATIONS {
-            break;
-        }
-
-        // Accumulate energy for this memory
-        let total = energy_map.entry(item.mem_id).or_insert(0.0);
-        *total += item.energy;
-
-        // Calculate how much NEW energy we have to propagate
-        let already_propagated = propagated_energy.get(&item.mem_id).copied().unwrap_or(0.0);
-        let to_propagate = *total - already_propagated;
-
-        // Only propagate if there's meaningful new energy
-        if to_propagate > ENERGY_THRESHOLD {
-            propagated_energy.insert(item.mem_id, *total);
-
-            // Get neighbors with their effective strengths (using runtime weights)
-            let neighbors = get_relationships_for_memory(conn, item.mem_id, params)?;
-
-            for (neighbor_id, effective_strength) in neighbors {
-                let new_energy = to_propagate * params.energy_decay * effective_strength;
-
-                if new_energy > ENERGY_THRESHOLD {
-                    heap.push(ActivationItem {
-                        energy: new_energy,
-                        mem_id: neighbor_id,
-                    });
-                }
-            }
-        }
-    }
-
-    // Step 4: Filter by ID range, sort by energy, and take top `limit`
-    let mut activated: Vec<(i64, f64)> = energy_map
+    // Step 4: Filter by ID range, sort by score, and take top `limit`
+    let mut activated: Vec<(i64, f64)> = scores
         .into_iter()
         .filter(|(id, _)| {
             let above_from = params.from.map_or(true, |from| *id >= from);
@@ -275,14 +325,14 @@ pub(crate) fn surface_candidates(
 
     // Create a map for quick lookup
     let memory_map: HashMap<i64, Memory> = memories.into_iter().map(|m| (m.id, m)).collect();
-    let energy_map: HashMap<i64, f64> = activated.into_iter().collect();
+    let score_map: HashMap<i64, f64> = activated.into_iter().collect();
 
-    // Build result: activated items with energy, context items with energy=0
+    // Build result: activated items with score, context items with score=0
     let mut results: Vec<ActivatedMemory> = Vec::new();
 
     for id in all_ids {
         if let Some(mem) = memory_map.get(&id) {
-            let (energy, is_context) = if let Some(&e) = energy_map.get(&id) {
+            let (energy, is_context) = if let Some(&e) = score_map.get(&id) {
                 (e, false)
             } else {
                 (0.0, true)
@@ -295,7 +345,7 @@ pub(crate) fn surface_candidates(
         }
     }
 
-    // Sort by energy score (highest first)
+    // Sort by score (highest first)
     results.sort_by(|a, b| b.energy.partial_cmp(&a.energy).unwrap_or(Ordering::Equal));
 
     Ok(SearchResult {

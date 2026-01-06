@@ -3,8 +3,6 @@
 use rusqlite::{Connection, Result, params};
 use serde::Serialize;
 
-use crate::SearchParams;
-
 /// A single relationship event between two memories.
 #[derive(Debug, Clone, Serialize)]
 pub struct RelationshipEvent {
@@ -124,51 +122,6 @@ pub(crate) fn get_relationship<C: std::ops::Deref<Target = Connection>>(
     } else {
         Ok(None)
     }
-}
-
-/// Get all relationships for a memory (as either from_mem or to_mem).
-/// Returns strengths transformed via sigmoid: strength / (strength + k).
-/// This ensures edges are independent (strengthening one doesn't affect others)
-/// and bounded (always < 1.0), preventing energy blowup.
-pub(crate) fn get_relationships_for_memory(
-    conn: &Connection,
-    mem_id: i64,
-    params: &SearchParams,
-) -> Result<Vec<(i64, f64)>> {
-    use std::collections::HashMap;
-
-    // Single query with UNION ALL to get both directions
-    let mut stmt = conn.prepare_cached(
-        "SELECT to_mem AS neighbor, strength
-         FROM relationships WHERE from_mem = ?1
-         UNION ALL
-         SELECT from_mem AS neighbor, strength
-         FROM relationships WHERE to_mem = ?1",
-    )?;
-
-    let rows = stmt.query_map(rusqlite::params![mem_id], |row| {
-        let neighbor_id: i64 = row.get(0)?;
-        let strength: f64 = row.get(1)?;
-        Ok((neighbor_id, strength))
-    })?;
-
-    // Aggregate raw strengths per neighbor (sum of events)
-    let mut neighbor_raw: HashMap<i64, f64> = HashMap::new();
-    for row in rows {
-        let (neighbor_id, strength) = row?;
-        let eff = calculate_effective_strength(strength);
-        *neighbor_raw.entry(neighbor_id).or_insert(0.0) += eff;
-    }
-
-    // Sigmoid transform: strength / (strength + k)
-    // - Edges are independent (strengthening one doesn't affect others)
-    // - Bounded: always < 1.0, so decay * sigmoid < decay < 1 (no blowup)
-    // - k=1: strength=1 gives 0.5, strength=10 gives 0.91
-    let k = params.sigmoid_k;
-    Ok(neighbor_raw
-        .into_iter()
-        .map(|(id, raw)| (id, raw / (raw + k)))
-        .collect())
 }
 
 #[cfg(test)]
