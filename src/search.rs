@@ -317,8 +317,8 @@ pub(crate) fn surface_candidates(
     let mut activated: Vec<(i64, f64)> = scores
         .into_iter()
         .filter(|(id, _)| {
-            let above_from = params.from.map_or(true, |from| *id >= from);
-            let below_to = params.to.map_or(true, |to| *id <= to);
+            let above_from = params.from.is_none_or(|from| *id >= from);
+            let below_to = params.to.is_none_or(|to| *id <= to);
             above_from && below_to
         })
         .collect();

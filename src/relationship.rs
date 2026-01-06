@@ -19,16 +19,12 @@ pub struct Relationship {
     pub to_mem: i64,
     /// Raw strength (sum of events).
     pub effective_strength: f64,
-    /// Number of strengthening events for this pair.
-    pub event_count: usize,
 }
 
 /// Result of strengthening relationships.
 #[derive(Debug, Serialize)]
 pub struct StrengthenResult {
     pub relationships: Vec<Relationship>,
-    /// Number of new relationship events created.
-    pub event_count: usize,
 }
 
 /// Result of connecting memories (only creates if no existing connection).
@@ -117,7 +113,6 @@ pub(crate) fn get_relationship<C: std::ops::Deref<Target = Connection>>(
             from_mem,
             to_mem,
             effective_strength: total_effective,
-            event_count,
         }))
     } else {
         Ok(None)

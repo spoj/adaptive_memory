@@ -197,7 +197,6 @@ impl MemoryStore {
         let tx = self.conn.transaction()?;
 
         let mut relationships = Vec::new();
-        let mut event_count = 0;
 
         // Generate all pairs and add a new event for each (1.0 strength per pair)
         for i in 0..ids.len() {
@@ -206,7 +205,6 @@ impl MemoryStore {
 
                 // Add new relationship event with 1.0 strength
                 add_relationship_event(&tx, from_mem, to_mem, 1.0)?;
-                event_count += 1;
 
                 // Get the aggregated relationship (including the new event)
                 if let Some(rel) = get_relationship(&tx, from_mem, to_mem)? {
@@ -217,10 +215,7 @@ impl MemoryStore {
 
         tx.commit()?;
 
-        Ok(StrengthenResult {
-            relationships,
-            event_count,
-        })
+        Ok(StrengthenResult { relationships })
     }
 
     /// Connect memories that don't already have a relationship.
@@ -340,7 +335,7 @@ impl MemoryStore {
         let mut stmt = self.conn.prepare(&query)?;
 
         let param_refs: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p.as_ref()).collect();
-        let rows = stmt.query_map(param_refs.as_slice(), |row| Self::row_to_memory(row))?;
+        let rows = stmt.query_map(param_refs.as_slice(), Self::row_to_memory)?;
 
         let memories: Result<Vec<_>, _> = rows.collect();
         Ok(memories?)
@@ -361,7 +356,7 @@ impl MemoryStore {
              LIMIT ?1",
         )?;
 
-        let rows = stmt.query_map(params![limit as i64], |row| Self::row_to_memory(row))?;
+        let rows = stmt.query_map(params![limit as i64], Self::row_to_memory)?;
 
         let memories: Result<Vec<_>, _> = rows.collect();
         Ok(memories?)
@@ -627,20 +622,16 @@ mod tests {
 
         // Strengthen memories 1, 2, 3 - creates 1.0 strength for each pair
         let result = store.strengthen(&[1, 2, 3]).unwrap();
-        assert_eq!(result.event_count, 3); // 3 pairs: (1,2), (1,3), (2,3)
         assert_eq!(result.relationships.len(), 3);
 
         // Each relationship should have 1 event with strength 1.0
         for rel in &result.relationships {
-            assert_eq!(rel.event_count, 1);
             assert!((rel.effective_strength - 1.0).abs() < 0.001);
         }
 
         // Strengthen just 2 memories again - adds another 1.0 event
         let result = store.strengthen(&[1, 2]).unwrap();
-        assert_eq!(result.event_count, 1);
         assert_eq!(result.relationships.len(), 1);
-        assert_eq!(result.relationships[0].event_count, 2); // 2 events now
         assert!((result.relationships[0].effective_strength - 2.0).abs() < 0.001);
         // 2.0 total
     }
