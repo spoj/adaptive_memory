@@ -100,8 +100,9 @@ impl Graph {
             Ok((id, from, to, strength))
         })?;
 
-        // Step 2: Process events with inhibition
-        // For each edge, track the graph_strength when it was last seen
+        // Step 2: Process events with inhibition, then apply decay
+        // Inhibition is based on raw structural activity (graph_strength accumulates raw contributions)
+        // Decay is applied afterwards as a global "how much do I care about old stuff now" filter
         let mut combined_edges: HashMap<(i64, i64), f64> = HashMap::new();
         let mut edge_last_seen: HashMap<(i64, i64), f64> = HashMap::new();
         let mut graph_strength: f64 = 0.0;
@@ -115,26 +116,26 @@ impl Graph {
             // Canonical edge key
             let key = if from < to { (from, to) } else { (to, from) };
 
-            // Apply decay based on relationship event age
-            let age = max_rel_id - id;
-            let decayed_strength = decay_strength(raw_strength, age, decay_scale);
-
-            // Apply inhibition based on graph activity since last seen
-            let contribution = if inhibit_scale > 0.0 {
+            // Step 2a: Apply inhibition based on graph activity since last seen
+            let inhibited_strength = if inhibit_scale > 0.0 {
                 if let Some(&last_gs) = edge_last_seen.get(&key) {
                     let gap = graph_strength - last_gs;
-                    decayed_strength * (1.0 - (-gap / inhibit_scale).exp())
+                    raw_strength * (1.0 - (-gap / inhibit_scale).exp())
                 } else {
                     // First time seeing this edge - full credit
-                    decayed_strength
+                    raw_strength
                 }
             } else {
-                decayed_strength
+                raw_strength
             };
 
-            // Update graph strength and edge tracking
-            graph_strength += contribution;
+            // Update graph strength tracking (based on inhibited, not decayed)
+            graph_strength += inhibited_strength;
             edge_last_seen.insert(key, graph_strength);
+
+            // Step 2b: Apply decay based on relationship event age
+            let age = max_rel_id - id;
+            let contribution = decay_strength(inhibited_strength, age, decay_scale);
 
             // Accumulate edge strength
             *combined_edges.entry(key).or_default() += contribution;
