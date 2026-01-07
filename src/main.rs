@@ -153,7 +153,7 @@ fn main() {
         None => !cli.json, // default: local for text, utc for json
     };
 
-    // Build SearchParams from global options
+    // Build SearchParams from global options (limit handled per-context in run_selector)
     let params = SearchParams {
         limit: cli.limit.unwrap_or(DEFAULT_LIMIT),
         alpha: cli.alpha.unwrap_or(0.85),
@@ -166,7 +166,7 @@ fn main() {
     let result = if let Some(command) = cli.command {
         run(command, &db_path, cli.json, use_local, &params)
     } else if let Some(selector) = cli.selector {
-        run_selector(&selector, &db_path, cli.json, use_local, &params)
+        run_selector(&selector, &db_path, cli.json, use_local, &params, cli.limit)
     } else {
         // No command and no selector - show tail
         run(
@@ -198,12 +198,16 @@ fn main() {
 /// - `1,3,5+` -> related 1,3,5
 /// - `1:10+` -> related on all IDs in range
 /// - anything else -> search query
+///
+/// `explicit_limit`: The user-provided --limit value (None if not specified).
+/// For ID-based selectors, default is unlimited. For search, default is DEFAULT_LIMIT.
 fn run_selector(
     selector: &str,
     db_path: &PathBuf,
     json_output: bool,
     use_local: bool,
     params: &SearchParams,
+    explicit_limit: Option<usize>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (selector_part, is_related) = if selector.ends_with('+') {
         (&selector[..selector.len() - 1], true)
@@ -238,9 +242,9 @@ fn run_selector(
                 }
                 run_related_ids(&ids, db_path, json_output, use_local, params)
             } else {
-                // Just list the range
+                // Just list the range - unlimited by default, or explicit limit
                 let store = MemoryStore::open(db_path)?;
-                let memories = store.list(from, to, Some(params.limit))?;
+                let memories = store.list(from, to, explicit_limit)?;
                 if json_output {
                     let result = serde_json::json!({
                         "count": memories.len(),
