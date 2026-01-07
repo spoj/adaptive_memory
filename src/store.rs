@@ -430,10 +430,18 @@ impl MemoryStore {
         }
     }
 
-    /// Get the latest N memories, ordered by ID descending (most recent first).
-    /// Shorthand for `list(None, None, Some(n))`.
+    /// Get the most recent N memories, returned in chronological order (oldest first).
+    ///
+    /// This fetches the last N memories by ID, then reverses to show chronologically.
     pub fn tail(&self, n: usize) -> Result<Vec<Memory>, MemoryError> {
-        self.list(None, None, Some(n))
+        // Get last N by ID descending, then reverse for chronological order
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, datetime, text, source FROM memories ORDER BY id DESC LIMIT ?1")?;
+        let rows = stmt.query_map(params![n as i64], Self::row_to_memory)?;
+        let mut memories: Vec<Memory> = rows.collect::<Result<Vec<_>, _>>()?;
+        memories.reverse();
+        Ok(memories)
     }
 
     /// List memories by ID range.
@@ -442,7 +450,7 @@ impl MemoryStore {
     /// - `to_id`: End ID (inclusive). If None, goes to the end.
     /// - `limit`: Maximum number of results. If None, returns all in range.
     ///
-    /// Results are ordered by ID descending (most recent first).
+    /// Results are ordered by ID ascending (chronological order).
     pub fn list(
         &self,
         from_id: Option<i64>,
@@ -476,7 +484,7 @@ impl MemoryStore {
         };
 
         let query = format!(
-            "SELECT id, datetime, text, source FROM memories{} ORDER BY id DESC{}",
+            "SELECT id, datetime, text, source FROM memories{} ORDER BY id ASC{}",
             where_clause, limit_clause
         );
 
@@ -889,33 +897,33 @@ mod tests {
         // List all (no filters)
         let all = store.list(None, None, None).unwrap();
         assert_eq!(all.len(), 5);
-        // Should be ordered by ID descending
-        assert_eq!(all[0].id, 5);
-        assert_eq!(all[4].id, 1);
+        // Should be ordered by ID ascending (chronological)
+        assert_eq!(all[0].id, 1);
+        assert_eq!(all[4].id, 5);
 
         // List with from_id
         let from_3 = store.list(Some(3), None, None).unwrap();
         assert_eq!(from_3.len(), 3);
-        assert_eq!(from_3[0].id, 5);
-        assert_eq!(from_3[2].id, 3);
+        assert_eq!(from_3[0].id, 3);
+        assert_eq!(from_3[2].id, 5);
 
         // List with to_id
         let to_3 = store.list(None, Some(3), None).unwrap();
         assert_eq!(to_3.len(), 3);
-        assert_eq!(to_3[0].id, 3);
-        assert_eq!(to_3[2].id, 1);
+        assert_eq!(to_3[0].id, 1);
+        assert_eq!(to_3[2].id, 3);
 
         // List with range
         let range = store.list(Some(2), Some(4), None).unwrap();
         assert_eq!(range.len(), 3);
-        assert_eq!(range[0].id, 4);
-        assert_eq!(range[2].id, 2);
+        assert_eq!(range[0].id, 2);
+        assert_eq!(range[2].id, 4);
 
         // List with limit
         let limited = store.list(None, None, Some(2)).unwrap();
         assert_eq!(limited.len(), 2);
-        assert_eq!(limited[0].id, 5);
-        assert_eq!(limited[1].id, 4);
+        assert_eq!(limited[0].id, 1);
+        assert_eq!(limited[1].id, 2);
 
         // List with range and limit
         let range_limited = store.list(Some(1), Some(5), Some(2)).unwrap();
@@ -930,10 +938,11 @@ mod tests {
         store.add("Second", None).unwrap();
         store.add("Third", None).unwrap();
 
+        // tail(2) gets the last 2 memories in chronological order
         let tail = store.tail(2).unwrap();
         assert_eq!(tail.len(), 2);
-        assert_eq!(tail[0].id, 3);
-        assert_eq!(tail[1].id, 2);
+        assert_eq!(tail[0].id, 2); // older of the two
+        assert_eq!(tail[1].id, 3); // newer
     }
 
     #[test]
