@@ -18,12 +18,6 @@ pub struct AddMemoryResult {
     pub memory: Memory,
 }
 
-/// Result of amending a memory.
-#[derive(Debug, Serialize)]
-pub struct AmendResult {
-    pub memory: Memory,
-}
-
 /// Database statistics.
 #[derive(Debug, Serialize)]
 pub struct Stats {
@@ -52,4 +46,45 @@ pub struct GraphStats {
     pub max_degree: i64,
     /// Average degree of connected memories (0 if none)
     pub avg_degree: f64,
+}
+
+/// A single day's worth of memories in the timeline.
+#[derive(Debug, Serialize)]
+pub struct TimelineBucket {
+    /// Date in YYYY-MM-DD format
+    pub date: String,
+    /// First (lowest) memory ID on this date
+    pub min_id: i64,
+    /// Last (highest) memory ID on this date
+    pub max_id: i64,
+    /// Number of memories on this date
+    pub count: i64,
+}
+
+/// Timeline showing memory ID distribution by date.
+#[derive(Debug, Serialize)]
+pub struct Timeline {
+    /// Daily buckets, ordered by date descending (most recent first)
+    pub buckets: Vec<TimelineBucket>,
+    /// Summary statistics
+    pub summary: TimelineSummary,
+}
+
+/// Summary statistics for the timeline.
+#[derive(Debug, Serialize)]
+pub struct TimelineSummary {
+    /// Total number of memories
+    pub total_memories: i64,
+    /// Oldest memory date (YYYY-MM-DD)
+    pub oldest_date: Option<String>,
+    /// Newest memory date (YYYY-MM-DD)
+    pub newest_date: Option<String>,
+    /// Oldest memory ID
+    pub oldest_id: Option<i64>,
+    /// Newest memory ID
+    pub newest_id: Option<i64>,
+    /// Number of days with memories
+    pub total_days: usize,
+    /// Average memories per day
+    pub avg_per_day: f64,
 }

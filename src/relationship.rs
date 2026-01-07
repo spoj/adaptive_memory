@@ -27,15 +27,6 @@ pub struct StrengthenResult {
     pub relationships: Vec<Relationship>,
 }
 
-/// Result of connecting memories (only creates if no existing connection).
-#[derive(Debug, Serialize)]
-pub struct ConnectResult {
-    /// Relationships that were created (pairs that had no prior connection).
-    pub created: Vec<Relationship>,
-    /// Pairs that were skipped because they already had a connection.
-    pub skipped: Vec<(i64, i64)>,
-}
-
 /// Calculate effective strength (simply returns stored strength, no decay).
 pub fn calculate_effective_strength(stored_strength: f64) -> f64 {
     stored_strength
@@ -48,12 +39,13 @@ pub(crate) fn canonicalize(a: i64, b: i64) -> (i64, i64) {
 
 /// Add a new relationship event (used internally).
 /// Multiple events between the same pair are allowed and will be summed.
+/// Returns the ID of the newly created event.
 pub(crate) fn add_relationship_event<C: std::ops::Deref<Target = Connection>>(
     conn: &C,
     from_mem: i64,
     to_mem: i64,
     strength: f64,
-) -> Result<()> {
+) -> Result<i64> {
     let (from_mem, to_mem) = canonicalize(from_mem, to_mem);
 
     conn.execute(
@@ -62,24 +54,7 @@ pub(crate) fn add_relationship_event<C: std::ops::Deref<Target = Connection>>(
         params![from_mem, to_mem, strength],
     )?;
 
-    Ok(())
-}
-
-/// Check if a relationship exists between two memories (order doesn't matter).
-pub(crate) fn relationship_exists<C: std::ops::Deref<Target = Connection>>(
-    conn: &C,
-    a: i64,
-    b: i64,
-) -> Result<bool> {
-    let (from_mem, to_mem) = canonicalize(a, b);
-
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM relationships WHERE from_mem = ?1 AND to_mem = ?2",
-        rusqlite::params![from_mem, to_mem],
-        |row| row.get(0),
-    )?;
-
-    Ok(count > 0)
+    Ok(conn.last_insert_rowid())
 }
 
 /// Get aggregated relationship between two memories (order doesn't matter).

@@ -17,6 +17,9 @@ pub struct ActivatedMemory {
     pub memory: Memory,
     /// PPR score. 0.0 for context items.
     pub energy: f64,
+    /// True if this was an initial FTS match or explicit seed ID.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub is_seed: bool,
     /// True if this is a context item (fetched via --context, not by relevance).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub is_context: bool,
@@ -26,6 +29,19 @@ pub struct ActivatedMemory {
 #[derive(Debug, Serialize)]
 pub struct SearchResult {
     pub query: String,
+    pub seed_count: usize,
+    pub total_activated: usize,
+    /// Number of PPR iterations performed.
+    pub iterations: usize,
+    /// Results sorted by PPR score (highest first).
+    pub memories: Vec<ActivatedMemory>,
+}
+
+/// Result of find_related (PPR from seed IDs, no text search).
+#[derive(Debug, Serialize)]
+pub struct RelatedResult {
+    /// The seed memory IDs provided.
+    pub seeds: Vec<i64>,
     pub seed_count: usize,
     pub total_activated: usize,
     /// Number of PPR iterations performed.
@@ -45,41 +61,74 @@ struct Graph {
     degree: HashMap<i64, usize>,
 }
 
+/// Calculate effective strength with power-law decay.
+/// Formula: strength / (1 + age / scale)
+/// When scale = 0.0, no decay is applied.
+fn decay_strength(strength: f64, age: i64, decay_scale: f64) -> f64 {
+    if decay_scale <= 0.0 || age <= 0 {
+        return strength;
+    }
+    strength / (1.0 + (age as f64) / decay_scale)
+}
+
 impl Graph {
-    /// Load entire graph from database.
-    fn load(conn: &Connection) -> Result<Self, MemoryError> {
+    /// Load entire graph from database with optional decay.
+    /// decay_scale: at this age (in relationship event IDs), strength halves. 0 = no decay.
+    fn load(conn: &Connection, decay_scale: f64) -> Result<Self, MemoryError> {
         let mut edges: HashMap<i64, Vec<(i64, f64)>> = HashMap::new();
         let mut out_weight: HashMap<i64, f64> = HashMap::new();
         let mut degree: HashMap<i64, usize> = HashMap::new();
 
-        // Load all relationships, aggregate by (from, to) pair
-        let mut stmt = conn.prepare(
-            "SELECT from_mem, to_mem, SUM(strength) as total_strength
-             FROM relationships
-             GROUP BY from_mem, to_mem",
-        )?;
+        // Get max relationship ID for decay calculation
+        let max_rel_id: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(id), 0) FROM relationships",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
+        // Step 1: Aggregate all relationships into undirected edges with summed strength
+        // We use (min(a,b), max(a,b)) as key to combine A->B and B->A
+        let mut combined_edges: HashMap<(i64, i64), f64> = HashMap::new();
+
+        let mut stmt = conn.prepare("SELECT id, from_mem, to_mem, strength FROM relationships")?;
 
         let rows = stmt.query_map([], |row| {
-            let from: i64 = row.get(0)?;
-            let to: i64 = row.get(1)?;
-            let strength: f64 = row.get(2)?;
-            Ok((from, to, strength))
+            let id: i64 = row.get(0)?;
+            let from: i64 = row.get(1)?;
+            let to: i64 = row.get(2)?;
+            let strength: f64 = row.get(3)?;
+            Ok((id, from, to, strength))
         })?;
 
         for row in rows {
-            let (from, to, strength) = row?;
+            let (id, from, to, strength) = row?;
+            if from == to {
+                continue;
+            } // Skip self-loops
 
-            // Bidirectional: add edge in both directions
-            edges.entry(from).or_default().push((to, strength));
-            edges.entry(to).or_default().push((from, strength));
+            // Apply decay based on relationship event age
+            let age = max_rel_id - id;
+            let effective_strength = decay_strength(strength, age, decay_scale);
+
+            let key = if from < to { (from, to) } else { (to, from) };
+            *combined_edges.entry(key).or_default() += effective_strength;
+        }
+
+        // Step 2: Build the graph structures from the aggregated undirected edges
+        for ((u, v), strength) in combined_edges {
+            // Add to adjacency list for both directions
+            edges.entry(u).or_default().push((v, strength));
+            edges.entry(v).or_default().push((u, strength));
 
             // Track out-weight for both directions
-            *out_weight.entry(from).or_default() += strength;
-            *out_weight.entry(to).or_default() += strength;
+            *out_weight.entry(u).or_default() += strength;
+            *out_weight.entry(v).or_default() += strength;
 
-            // Track degree (number of connections)
-            *degree.entry(from).or_default() += 1;
-            *degree.entry(to).or_default() += 1;
+            // Each unique neighbor relationship counts as 1 for degree
+            *degree.entry(u).or_default() += 1;
+            *degree.entry(v).or_default() += 1;
         }
 
         Ok(Self {
@@ -307,8 +356,8 @@ pub(crate) fn surface_candidates(
     let seeds = fts_search(conn, query, limit)?;
     let seed_count = seeds.len();
 
-    // Step 2: Load graph into memory
-    let graph = Graph::load(conn)?;
+    // Step 2: Load graph into memory (with optional decay)
+    let graph = Graph::load(conn, params.decay)?;
 
     // Step 3: Run PPR with degree penalty
     let (scores, iterations) = ppr(&graph, &seeds, params.alpha, params.beta);
@@ -352,6 +401,7 @@ pub(crate) fn surface_candidates(
     // Create a map for quick lookup
     let memory_map: HashMap<i64, Memory> = memories.into_iter().map(|m| (m.id, m)).collect();
     let score_map: HashMap<i64, f64> = activated.into_iter().collect();
+    let seed_set: HashSet<i64> = seeds.iter().map(|(id, _)| *id).collect();
 
     // Build result: activated items with score, context items with score=0
     let mut results: Vec<ActivatedMemory> = Vec::new();
@@ -366,6 +416,7 @@ pub(crate) fn surface_candidates(
             results.push(ActivatedMemory {
                 memory: mem.clone(),
                 energy,
+                is_seed: seed_set.contains(&id),
                 is_context,
             });
         }
@@ -376,6 +427,106 @@ pub(crate) fn surface_candidates(
 
     Ok(SearchResult {
         query: query.to_string(),
+        seed_count,
+        total_activated,
+        iterations,
+        memories: results,
+    })
+}
+
+/// Find related memories using PPR from seed IDs (no text search).
+///
+/// This is like search but skips the FTS5 keyword step - you provide
+/// seed memory IDs directly and get related memories via graph traversal.
+pub(crate) fn find_related(
+    conn: &Connection,
+    seed_ids: &[i64],
+    params: &SearchParams,
+) -> Result<RelatedResult, MemoryError> {
+    if seed_ids.is_empty() {
+        return Err(MemoryError::InvalidInput(
+            "At least one seed memory ID is required".to_string(),
+        ));
+    }
+
+    let limit = params.limit;
+
+    // All seeds get equal weight (1.0 each, will be normalized in ppr())
+    let seeds: Vec<(i64, f64)> = seed_ids.iter().map(|&id| (id, 1.0)).collect();
+    let seed_count = seeds.len();
+
+    // Load graph into memory (with optional decay)
+    let graph = Graph::load(conn, params.decay)?;
+
+    // Run PPR with degree penalty
+    let (scores, iterations) = ppr(&graph, &seeds, params.alpha, params.beta);
+
+    // Filter by ID range, sort by score, and take top `limit`
+    // Exclude seed IDs from results (we want *related* memories, not the seeds themselves)
+    let seed_set: HashSet<i64> = seed_ids.iter().copied().collect();
+    let mut activated: Vec<(i64, f64)> = scores
+        .into_iter()
+        .filter(|(id, _)| {
+            let is_seed = seed_set.contains(id);
+            let above_from = params.from.is_none_or(|from| *id >= from);
+            let below_to = params.to.is_none_or(|to| *id <= to);
+            !is_seed && above_from && below_to
+        })
+        .collect();
+    activated.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+    activated.truncate(limit);
+
+    let total_activated = activated.len();
+
+    // Expand context if requested
+    let activated_ids: HashSet<i64> = activated.iter().map(|(id, _)| *id).collect();
+    let mut context_ids: HashSet<i64> = HashSet::new();
+
+    if params.context > 0 {
+        for &(id, _) in &activated {
+            let start = (id - params.context as i64).max(1);
+            let end = id + params.context as i64;
+            for ctx_id in start..=end {
+                if ctx_id != id && !activated_ids.contains(&ctx_id) && !seed_set.contains(&ctx_id) {
+                    context_ids.insert(ctx_id);
+                }
+            }
+        }
+    }
+
+    // Fetch all memory objects (activated + context)
+    let mut all_ids: Vec<i64> = activated.iter().map(|(id, _)| *id).collect();
+    all_ids.extend(context_ids.iter());
+    let memories = get_memories_by_ids(conn, &all_ids)?;
+
+    // Create maps for quick lookup
+    let memory_map: HashMap<i64, Memory> = memories.into_iter().map(|m| (m.id, m)).collect();
+    let score_map: HashMap<i64, f64> = activated.into_iter().collect();
+
+    // Build result: activated items with score, context items with score=0
+    let mut results: Vec<ActivatedMemory> = Vec::new();
+
+    for id in all_ids {
+        if let Some(mem) = memory_map.get(&id) {
+            let (energy, is_context) = if let Some(&e) = score_map.get(&id) {
+                (e, false)
+            } else {
+                (0.0, true)
+            };
+            results.push(ActivatedMemory {
+                memory: mem.clone(),
+                energy,
+                is_seed: seed_set.contains(&id),
+                is_context,
+            });
+        }
+    }
+
+    // Sort by score (highest first)
+    results.sort_by(|a, b| b.energy.partial_cmp(&a.energy).unwrap_or(Ordering::Equal));
+
+    Ok(RelatedResult {
+        seeds: seed_ids.to_vec(),
         seed_count,
         total_activated,
         iterations,

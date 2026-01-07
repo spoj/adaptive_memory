@@ -4,16 +4,43 @@ use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, params};
+use serde::{Deserialize, Serialize};
 
 use crate::db::{get_max_memory_id, init_schema};
 use crate::error::MemoryError;
-use crate::memory::{AddMemoryResult, AmendResult, GraphStats, Memory, Stats};
-use crate::relationship::{
-    ConnectResult, StrengthenResult, add_relationship_event, canonicalize, get_relationship,
-    relationship_exists,
+use crate::memory::{
+    AddMemoryResult, GraphStats, Memory, Stats, Timeline, TimelineBucket, TimelineSummary,
 };
-use crate::search::{SearchResult, surface_candidates};
+use crate::relationship::{
+    StrengthenResult, add_relationship_event, canonicalize, get_relationship,
+};
+use crate::search::{RelatedResult, SearchResult, find_related, surface_candidates};
 use crate::{MAX_STRENGTHEN_SET, SearchParams};
+
+/// Payload for an "add" operation (for undo).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AddPayload {
+    memory_id: i64,
+    text: String,
+}
+
+/// Payload for a "strengthen" operation (for undo).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StrengthenPayload {
+    /// The relationship event IDs that were created.
+    event_ids: Vec<i64>,
+    /// The memory IDs that were strengthened (for display).
+    memory_ids: Vec<i64>,
+}
+
+/// Result of an undo operation.
+#[derive(Debug, Serialize)]
+pub struct UndoResult {
+    /// Type of operation that was undone ("add" or "strengthen").
+    pub op_type: String,
+    /// Human-readable description of what was undone.
+    pub description: String,
+}
 
 /// The main interface for the adaptive memory system.
 ///
@@ -93,13 +120,31 @@ impl MemoryStore {
 
         let datetime_str_to_store = datetime.to_rfc3339();
 
+        let tx = self.conn.transaction()?;
+
         // Insert the new memory (no temporal relationships created)
-        self.conn.execute(
+        tx.execute(
             "INSERT INTO memories (datetime, text, source) VALUES (?1, ?2, ?3)",
             params![datetime_str_to_store, text, source],
         )?;
 
-        let new_id = self.conn.last_insert_rowid();
+        let new_id = tx.last_insert_rowid();
+
+        // Log the operation for undo
+        let payload = AddPayload {
+            memory_id: new_id,
+            text: text.to_string(),
+        };
+        let payload_json = serde_json::to_string(&payload).map_err(|e| {
+            MemoryError::InvalidInput(format!("Failed to serialize payload: {}", e))
+        })?;
+
+        tx.execute(
+            "INSERT INTO operations (op_type, payload, created_at) VALUES (?1, ?2, ?3)",
+            params!["add", payload_json, Utc::now().to_rfc3339()],
+        )?;
+
+        tx.commit()?;
 
         // Update cache
         self.cached_max_mem = new_id;
@@ -114,51 +159,6 @@ impl MemoryStore {
         Ok(AddMemoryResult { memory })
     }
 
-    /// Amend (update) an existing memory's text.
-    ///
-    /// Only allowed if the memory has no relationships to memories with higher IDs.
-    /// This ensures we don't modify memories that later memories depend on.
-    pub fn amend(&mut self, id: i64, new_text: &str) -> Result<AmendResult, MemoryError> {
-        // Check if memory exists
-        let memory = self
-            .get(id)?
-            .ok_or_else(|| MemoryError::InvalidInput(format!("Memory {} does not exist", id)))?;
-
-        // Check for relationships to later memories
-        let has_later_relationship: bool = self.conn.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM relationships
-                WHERE (from_mem = ?1 AND to_mem > ?1)
-                   OR (to_mem = ?1 AND from_mem > ?1)
-            )",
-            params![id],
-            |row| row.get(0),
-        )?;
-
-        if has_later_relationship {
-            return Err(MemoryError::InvalidInput(format!(
-                "Cannot amend memory {} - it has relationships to later memories",
-                id
-            )));
-        }
-
-        // Update the memory text
-        self.conn.execute(
-            "UPDATE memories SET text = ?1 WHERE id = ?2",
-            params![new_text, id],
-        )?;
-
-        // Return updated memory
-        let updated = Memory {
-            id: memory.id,
-            datetime: memory.datetime,
-            text: new_text.to_string(),
-            source: memory.source,
-        };
-
-        Ok(AmendResult { memory: updated })
-    }
-
     /// Search for memories using text query and spreading activation.
     ///
     /// If the query is empty, returns the most recent memories.
@@ -166,11 +166,22 @@ impl MemoryStore {
         surface_candidates(&self.conn, query, params)
     }
 
+    /// Find memories related to the given seed IDs using PPR (no text search).
+    ///
+    /// This is like search but skips the FTS5 keyword step - you provide
+    /// seed memory IDs directly and get related memories via graph traversal.
+    pub fn related(
+        &self,
+        seed_ids: &[i64],
+        params: &SearchParams,
+    ) -> Result<RelatedResult, MemoryError> {
+        find_related(&self.conn, seed_ids, params)
+    }
+
     /// Strengthen relationships between a set of memory IDs.
     ///
-    /// Adds a new explicit relationship event for each pair.
-    /// The strength per pair is distributed as 1.0 / num_pairs,
-    /// so strengthening more memories at once distributes the same total strength.
+    /// Adds a new explicit relationship event for each pair with strength 1.0.
+    /// Repeated calls accumulate strength.
     ///
     /// This operation is wrapped in a transaction for atomicity.
     pub fn strengthen(&mut self, ids: &[i64]) -> Result<StrengthenResult, MemoryError> {
@@ -197,6 +208,7 @@ impl MemoryStore {
         let tx = self.conn.transaction()?;
 
         let mut relationships = Vec::new();
+        let mut event_ids = Vec::new();
 
         // Generate all pairs and add a new event for each (1.0 strength per pair)
         for i in 0..ids.len() {
@@ -204,7 +216,8 @@ impl MemoryStore {
                 let (from_mem, to_mem) = canonicalize(ids[i], ids[j]);
 
                 // Add new relationship event with 1.0 strength
-                add_relationship_event(&tx, from_mem, to_mem, 1.0)?;
+                let event_id = add_relationship_event(&tx, from_mem, to_mem, 1.0)?;
+                event_ids.push(event_id);
 
                 // Get the aggregated relationship (including the new event)
                 if let Some(rel) = get_relationship(&tx, from_mem, to_mem)? {
@@ -213,58 +226,114 @@ impl MemoryStore {
             }
         }
 
+        // Log the operation for undo
+        let payload = StrengthenPayload {
+            event_ids,
+            memory_ids: ids.to_vec(),
+        };
+        let payload_json = serde_json::to_string(&payload).map_err(|e| {
+            MemoryError::InvalidInput(format!("Failed to serialize payload: {}", e))
+        })?;
+
+        tx.execute(
+            "INSERT INTO operations (op_type, payload, created_at) VALUES (?1, ?2, ?3)",
+            params!["strengthen", payload_json, Utc::now().to_rfc3339()],
+        )?;
+
         tx.commit()?;
 
         Ok(StrengthenResult { relationships })
     }
 
-    /// Connect memories that don't already have a relationship.
+    /// Undo the last operation (add or strengthen).
     ///
-    /// Unlike strengthen(), this only creates a relationship if none exists.
-    /// Each new connection gets strength 1.0. Existing connections are skipped.
+    /// This pops the most recent operation from the stack and reverses it:
+    /// - For "add": deletes the memory and any relationships pointing to it
+    /// - For "strengthen": deletes the relationship events that were created
     ///
-    /// This operation is wrapped in a transaction for atomicity.
-    pub fn connect(&mut self, ids: &[i64]) -> Result<ConnectResult, MemoryError> {
-        if ids.len() > MAX_STRENGTHEN_SET {
-            return Err(MemoryError::InvalidInput(format!(
-                "Cannot connect more than {} memories at once (got {})",
-                MAX_STRENGTHEN_SET,
-                ids.len()
-            )));
-        }
-
-        if ids.len() < 2 {
-            return Err(MemoryError::InvalidInput(
-                "At least two memory IDs are required to create connections".to_string(),
-            ));
-        }
+    /// Returns an error if there are no operations to undo.
+    pub fn undo(&mut self) -> Result<UndoResult, MemoryError> {
+        // Get the last operation
+        let (op_id, op_type, payload_json): (i64, String, String) = self
+            .conn
+            .query_row(
+                "SELECT id, op_type, payload FROM operations ORDER BY id DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|_| MemoryError::InvalidInput("No operations to undo".to_string()))?;
 
         let tx = self.conn.transaction()?;
 
-        let mut created = Vec::new();
-        let mut skipped = Vec::new();
+        let description = match op_type.as_str() {
+            "add" => {
+                let payload: AddPayload = serde_json::from_str(&payload_json).map_err(|e| {
+                    MemoryError::InvalidInput(format!("Failed to parse add payload: {}", e))
+                })?;
 
-        // Generate all pairs and only add if no existing connection
-        for i in 0..ids.len() {
-            for j in (i + 1)..ids.len() {
-                let (from_mem, to_mem) = canonicalize(ids[i], ids[j]);
+                // Delete any relationships pointing to this memory
+                tx.execute(
+                    "DELETE FROM relationships WHERE from_mem = ?1 OR to_mem = ?1",
+                    params![payload.memory_id],
+                )?;
 
-                if relationship_exists(&tx, from_mem, to_mem)? {
-                    skipped.push((from_mem, to_mem));
+                // Delete the memory (FTS trigger will handle cleanup)
+                tx.execute(
+                    "DELETE FROM memories WHERE id = ?1",
+                    params![payload.memory_id],
+                )?;
+
+                // Truncate text for display
+                let display_text = if payload.text.len() > 50 {
+                    format!("{}...", &payload.text[..50])
                 } else {
-                    // Create new relationship with strength 1.0
-                    add_relationship_event(&tx, from_mem, to_mem, 1.0)?;
+                    payload.text.clone()
+                };
 
-                    if let Some(rel) = get_relationship(&tx, from_mem, to_mem)? {
-                        created.push(rel);
-                    }
-                }
+                format!("add memory #{}: \"{}\"", payload.memory_id, display_text)
             }
-        }
+            "strengthen" => {
+                let payload: StrengthenPayload =
+                    serde_json::from_str(&payload_json).map_err(|e| {
+                        MemoryError::InvalidInput(format!(
+                            "Failed to parse strengthen payload: {}",
+                            e
+                        ))
+                    })?;
+
+                // Delete the specific relationship events
+                for event_id in &payload.event_ids {
+                    tx.execute("DELETE FROM relationships WHERE id = ?1", params![event_id])?;
+                }
+
+                let ids_str: Vec<String> =
+                    payload.memory_ids.iter().map(|id| id.to_string()).collect();
+                format!(
+                    "strengthen {} relationships between memories [{}]",
+                    payload.event_ids.len(),
+                    ids_str.join(", ")
+                )
+            }
+            _ => {
+                return Err(MemoryError::InvalidInput(format!(
+                    "Unknown operation type: {}",
+                    op_type
+                )));
+            }
+        };
+
+        // Remove the operation from the log
+        tx.execute("DELETE FROM operations WHERE id = ?1", params![op_id])?;
 
         tx.commit()?;
 
-        Ok(ConnectResult { created, skipped })
+        // Update cached max memory ID
+        self.cached_max_mem = get_max_memory_id(&self.conn)?;
+
+        Ok(UndoResult {
+            op_type,
+            description,
+        })
     }
 
     /// Get a memory by ID.
@@ -498,6 +567,60 @@ impl MemoryStore {
             max_degree,
             avg_degree,
         })
+    }
+
+    /// Get the timeline showing memory ID distribution by date.
+    ///
+    /// Returns daily buckets with ID ranges, useful for finding the ID range
+    /// for a specific date when using ranged search.
+    pub fn timeline(&self) -> Result<Timeline, MemoryError> {
+        // Query to get daily aggregates
+        let mut stmt = self.conn.prepare(
+            "SELECT 
+                DATE(datetime) as date,
+                MIN(id) as min_id,
+                MAX(id) as max_id,
+                COUNT(*) as count
+             FROM memories
+             GROUP BY DATE(datetime)
+             ORDER BY date DESC",
+        )?;
+
+        let buckets: Vec<TimelineBucket> = stmt
+            .query_map([], |row| {
+                Ok(TimelineBucket {
+                    date: row.get(0)?,
+                    min_id: row.get(1)?,
+                    max_id: row.get(2)?,
+                    count: row.get(3)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        // Compute summary
+        let total_memories: i64 = buckets.iter().map(|b| b.count).sum();
+        let total_days = buckets.len();
+        let avg_per_day = if total_days > 0 {
+            total_memories as f64 / total_days as f64
+        } else {
+            0.0
+        };
+
+        let newest = buckets.first();
+        let oldest = buckets.last();
+
+        let summary = TimelineSummary {
+            total_memories,
+            oldest_date: oldest.map(|b| b.date.clone()),
+            newest_date: newest.map(|b| b.date.clone()),
+            oldest_id: oldest.map(|b| b.min_id),
+            newest_id: newest.map(|b| b.max_id),
+            total_days,
+            avg_per_day,
+        };
+
+        Ok(Timeline { buckets, summary })
     }
 
     /// Get multiple memories by their IDs.
@@ -781,86 +904,129 @@ mod tests {
     }
 
     #[test]
-    fn test_connect() {
+    fn test_undo_add() {
         let mut store = MemoryStore::open_in_memory().unwrap();
 
+        // Add a memory
+        let result = store.add("Test memory to undo", Some("test")).unwrap();
+        assert_eq!(result.memory.id, 1);
+        assert_eq!(store.max_memory_id(), 1);
+
+        // Verify it exists
+        let mem = store.get(1).unwrap();
+        assert!(mem.is_some());
+
+        // Undo the add
+        let undo_result = store.undo().unwrap();
+        assert_eq!(undo_result.op_type, "add");
+        assert!(undo_result.description.contains("memory #1"));
+
+        // Verify it's gone
+        let mem = store.get(1).unwrap();
+        assert!(mem.is_none());
+        assert_eq!(store.max_memory_id(), 0);
+
+        // Undo again should fail (no operations left)
+        let err = store.undo().unwrap_err();
+        assert!(matches!(err, MemoryError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn test_undo_strengthen() {
+        let mut store = MemoryStore::open_in_memory().unwrap();
+
+        // Add memories
         store.add("mem1", None).unwrap();
         store.add("mem2", None).unwrap();
         store.add("mem3", None).unwrap();
-        store.add("mem4", None).unwrap();
 
-        // Connect 1 and 2 - should create relationship
-        let result = store.connect(&[1, 2]).unwrap();
-        assert_eq!(result.created.len(), 1);
-        assert!(result.skipped.is_empty());
-        assert_eq!(result.created[0].from_mem, 1);
-        assert_eq!(result.created[0].to_mem, 2);
+        // Strengthen creates relationships
+        let result = store.strengthen(&[1, 2, 3]).unwrap();
+        assert_eq!(result.relationships.len(), 3);
 
-        // Try to connect 1 and 2 again - should skip
-        let result = store.connect(&[1, 2]).unwrap();
-        assert!(result.created.is_empty());
-        assert_eq!(result.skipped.len(), 1);
-        assert_eq!(result.skipped[0], (1, 2));
-
-        // Connect 1, 2, 3 - (1,2) should skip, (1,3) and (2,3) should create
-        let result = store.connect(&[1, 2, 3]).unwrap();
-        assert_eq!(result.created.len(), 2);
-        assert_eq!(result.skipped.len(), 1);
-        assert_eq!(result.skipped[0], (1, 2));
-
-        // Verify stats
+        // Verify relationships exist
         let stats = store.stats().unwrap();
-        assert_eq!(stats.relationship_count, 3); // (1,2), (1,3), (2,3)
-        assert_eq!(stats.relationship_event_count, 3); // only 1 event each (unlike strengthen)
+        assert_eq!(stats.relationship_count, 3);
+        assert_eq!(stats.relationship_event_count, 3);
+
+        // Undo the strengthen
+        let undo_result = store.undo().unwrap();
+        assert_eq!(undo_result.op_type, "strengthen");
+        assert!(undo_result.description.contains("3 relationships"));
+
+        // Verify relationships are gone
+        let stats = store.stats().unwrap();
+        assert_eq!(stats.relationship_count, 0);
+        assert_eq!(stats.relationship_event_count, 0);
+
+        // Memories should still exist
+        assert!(store.get(1).unwrap().is_some());
+        assert!(store.get(2).unwrap().is_some());
+        assert!(store.get(3).unwrap().is_some());
     }
 
     #[test]
-    fn test_connect_validation() {
+    fn test_undo_sequence() {
         let mut store = MemoryStore::open_in_memory().unwrap();
 
-        // Single ID should fail
-        let err = store.connect(&[1]).unwrap_err();
-        assert!(matches!(err, MemoryError::InvalidInput(_)));
-
-        // Empty list should fail
-        let err = store.connect(&[]).unwrap_err();
-        assert!(matches!(err, MemoryError::InvalidInput(_)));
-    }
-
-    #[test]
-    fn test_amend() {
-        let mut store = MemoryStore::open_in_memory().unwrap();
-
-        store.add("Original text", Some("test")).unwrap();
+        // Add memory
+        store.add("First memory", None).unwrap();
         store.add("Second memory", None).unwrap();
-        store.add("Third memory", None).unwrap();
 
-        // Amend memory 3 (no relationships) - should succeed
-        let result = store.amend(3, "Updated third").unwrap();
-        assert_eq!(result.memory.id, 3);
-        assert_eq!(result.memory.text, "Updated third");
+        // Strengthen
+        store.strengthen(&[1, 2]).unwrap();
 
-        // Verify the change persisted
-        let mem = store.get(3).unwrap().unwrap();
-        assert_eq!(mem.text, "Updated third");
+        // Undo strengthen first
+        let undo_result = store.undo().unwrap();
+        assert_eq!(undo_result.op_type, "strengthen");
 
-        // Amend memory 1 (no relationships yet) - should succeed
-        let result = store.amend(1, "Updated first").unwrap();
-        assert_eq!(result.memory.text, "Updated first");
+        // Undo second add
+        let undo_result = store.undo().unwrap();
+        assert_eq!(undo_result.op_type, "add");
+        assert!(undo_result.description.contains("memory #2"));
 
-        // Create relationship from 1 to 2 (later memory)
-        store.connect(&[1, 2]).unwrap();
+        // Undo first add
+        let undo_result = store.undo().unwrap();
+        assert_eq!(undo_result.op_type, "add");
+        assert!(undo_result.description.contains("memory #1"));
 
-        // Amend memory 1 - should fail (has relationship to later memory 2)
-        let err = store.amend(1, "Try again").unwrap_err();
+        // No more operations
+        let err = store.undo().unwrap_err();
         assert!(matches!(err, MemoryError::InvalidInput(_)));
+    }
 
-        // Amend memory 2 - should succeed (only has relationship to earlier memory 1)
-        let result = store.amend(2, "Updated second").unwrap();
-        assert_eq!(result.memory.text, "Updated second");
+    #[test]
+    fn test_undo_add_with_relationships() {
+        let mut store = MemoryStore::open_in_memory().unwrap();
 
-        // Amend non-existent memory - should fail
-        let err = store.amend(999, "Nope").unwrap_err();
-        assert!(matches!(err, MemoryError::InvalidInput(_)));
+        // Add memories
+        store.add("mem1", None).unwrap();
+        store.add("mem2", None).unwrap();
+
+        // Strengthen to create relationship
+        store.strengthen(&[1, 2]).unwrap();
+
+        // Add another memory
+        store.add("mem3", None).unwrap();
+
+        // Strengthen 2 and 3
+        store.strengthen(&[2, 3]).unwrap();
+
+        // Undo last strengthen
+        store.undo().unwrap();
+
+        // Undo add of mem3
+        store.undo().unwrap();
+
+        // Now undo the first strengthen
+        store.undo().unwrap();
+
+        // Undo add of mem2 - should also remove any dangling relationship refs
+        store.undo().unwrap();
+
+        // Verify only mem1 exists with no relationships
+        let stats = store.stats().unwrap();
+        assert_eq!(stats.memory_count, 1);
+        assert_eq!(stats.relationship_count, 0);
     }
 }

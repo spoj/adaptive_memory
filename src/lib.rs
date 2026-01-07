@@ -94,6 +94,9 @@ pub struct SearchParams {
     pub from: Option<i64>,
     /// Filter results to memories with ID <= to (inclusive).
     pub to: Option<i64>,
+    /// Decay scale for relationship strength (power law).
+    /// At age = decay, strength is halved. 0.0 means no decay.
+    pub decay: f64,
 }
 
 impl Default for SearchParams {
@@ -105,6 +108,7 @@ impl Default for SearchParams {
             context: 0,
             from: None,
             to: None,
+            decay: 0.0,
         }
     }
 }
@@ -115,7 +119,9 @@ impl Default for SearchParams {
 
 pub use db::default_db_path;
 pub use error::MemoryError;
-pub use memory::{AddMemoryResult, AmendResult, GraphStats, Memory, Stats};
-pub use relationship::{ConnectResult, Relationship, RelationshipEvent, StrengthenResult};
-pub use search::{ActivatedMemory, SearchResult};
-pub use store::MemoryStore;
+pub use memory::{
+    AddMemoryResult, GraphStats, Memory, Stats, Timeline, TimelineBucket, TimelineSummary,
+};
+pub use relationship::{Relationship, RelationshipEvent, StrengthenResult};
+pub use search::{ActivatedMemory, RelatedResult, SearchResult};
+pub use store::{MemoryStore, UndoResult};

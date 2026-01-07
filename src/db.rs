@@ -129,6 +129,18 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
         [],
     )?;
 
+    // Create operations table for undo stack
+    // Stores the last operation (add or strengthen) for undo support
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS operations (
+            id INTEGER PRIMARY KEY,
+            op_type TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )",
+        [],
+    )?;
+
     Ok(())
 }
 

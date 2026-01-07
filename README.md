@@ -51,17 +51,19 @@ adaptive-memory [OPTIONS] <COMMAND>
 Commands:
   init        Initialize the database
   add         Add a new memory
-  amend       Amend (update) an existing memory's text
+  undo        Undo the last operation (add or strengthen)
   search      Search for memories
+  related     Find memories related to seed IDs via graph
   strengthen  Strengthen relationships between memories
-  connect     Connect memories (only if no existing relationship)
   tail        Show the latest N memories
   list        List memories by ID range
   stats       Show database statistics
   stray       Sample unconnected (stray) memories
+  timeline    Show memory ID distribution by date
 
 Global Options:
   --db <PATH>  Database path (default: ~/.adaptive_memory.db)
+  --json       Output in JSON format
 ```
 
 ### Initialize Database
@@ -113,7 +115,21 @@ Options:
   -l, --limit <N>      Maximum results (default: 10)
   -c, --context <N>    Fetch N memories before/after each result (default: 0)
   -a, --alpha <VALUE>  PPR damping factor (default: 0.85, lower = more weight to text matches)
+  -b, --beta <VALUE>   Degree penalty (default: 0.5, higher = boost unique links over hubs)
+  --from <ID>          Filter results to memories with ID >= from
+  --to <ID>            Filter results to memories with ID <= to
+  --decay <SCALE>      Decay scale for relationship strength (default: 0 = no decay)
 ```
+
+**Decay**: Older relationships contribute less to search. At age = scale, strength halves.
+Formula: `effective_strength = strength / (1 + age / scale)` where age is measured in relationship event IDs.
+
+| Scale | Effect |
+|-------|--------|
+| 0     | No decay (default) |
+| 100   | Aggressive - 50% at 100 events ago |
+| 1000  | Moderate - 50% at 1000 events ago |
+| 5000  | Gentle - old connections retain influence longer |
 
 **Examples:**
 ```bash
@@ -160,9 +176,38 @@ Results are sorted by PPR score (highest first). The `energy` field indicates re
 
 Context items (from `--context`) have `energy: 0.0` and `is_context: true`.
 
+### Related (Graph Search)
+
+Find memories related to specific seed IDs via graph traversal (no text search).
+
+```bash
+adaptive-memory related [OPTIONS] <IDS>
+
+Arguments:
+  <IDS>  Comma-separated seed memory IDs
+
+Options:
+  -l, --limit <N>      Maximum results (default: 10)
+  -c, --context <N>    Fetch N memories before/after each result (default: 0)
+  -a, --alpha <VALUE>  PPR damping factor (default: 0.85)
+  -b, --beta <VALUE>   Degree penalty (default: 0.5)
+  --from <ID>          Filter results to memories with ID >= from
+  --to <ID>            Filter results to memories with ID <= to
+  --decay <SCALE>      Decay scale for relationship strength (default: 0)
+```
+
+**Example:**
+```bash
+# Find memories related to memories 42 and 38
+adaptive-memory related 42,38
+
+# With decay - older relationships matter less
+adaptive-memory related 42,38 --decay 1000
+```
+
 ### Strengthen Relationships
 
-Create explicit associations between memories.
+Create explicit associations between memories. Always adds strength (use `undo` to reverse).
 
 ```bash
 adaptive-memory strengthen <IDS>
@@ -179,6 +224,9 @@ adaptive-memory strengthen 42,38
 # Link multiple (creates all pairs, 1.0 each)
 # 4 IDs = 6 pairs, each gets 1.0 strength
 adaptive-memory strengthen 1,5,12,34
+
+# Repeated calls accumulate strength
+adaptive-memory strengthen 42,38  # Now strength = 2.0
 ```
 
 **Output:**
@@ -188,48 +236,40 @@ adaptive-memory strengthen 1,5,12,34
     {
       "from_mem": 38,
       "to_mem": 42,
-      "effective_strength": 2.0,
-      "event_count": 2
+      "effective_strength": 2.0
     }
-  ],
-  "event_count": 1
+  ]
 }
 ```
 
-### Connect Memories
+### Undo
 
-Like `strengthen`, but only creates relationships if none exist between the pair.
-
-```bash
-adaptive-memory connect <IDS>
-
-Arguments:
-  <IDS>  Comma-separated memory IDs (max 10)
-```
-
-**Example:**
-```bash
-# Connect memories only if not already related
-adaptive-memory connect 42,38,15
-```
-
-### Amend Memory
-
-Update the text of an existing memory. Only allowed if the memory has no relationships to later memories (preserves integrity of memories that later entries depend on).
+Undo the last operation (`add` or `strengthen`). Works like a stack - can only undo the most recent operation.
 
 ```bash
-adaptive-memory amend <ID> <TEXT>
-
-Arguments:
-  <ID>    Memory ID to amend
-  <TEXT>  New text for the memory
+adaptive-memory undo
 ```
 
-**Example:**
+**Examples:**
 ```bash
-# Fix a typo in memory 42
-adaptive-memory amend 42 "Had coffee with Sarah, discussed the new project timeline"
+# Add a memory
+adaptive-memory add "Test memory"
+# Output: Memory 42 | ...
+
+# Oops, undo it
+adaptive-memory undo
+# Output: UNDONE: add memory #42: "Test memory"
+
+# Strengthen some memories
+adaptive-memory strengthen 1,2,3
+# Output: STRENGTHENED 3 relationships
+
+# Undo the strengthen
+adaptive-memory undo
+# Output: UNDONE: strengthen 3 relationships between memories [1, 2, 3]
 ```
+
+**Note**: Undo is append-only at the rear. You cannot undo operations from the middle of history - only the most recent operation can be undone.
 
 ### List Memories
 
@@ -394,7 +434,11 @@ fn main() -> Result<(), MemoryError> {
 |-----------|---------|-------------|
 | `limit` | 10 | Max results (also seed count for FTS) |
 | `alpha` | 0.85 | PPR damping factor (classic PageRank value) |
+| `beta` | 0.5 | Degree penalty (0=none, 0.5=sqrt, 1.0=linear) |
 | `context` | 0 | Fetch N memories before/after each result |
+| `from` | None | Filter by minimum memory ID |
+| `to` | None | Filter by maximum memory ID |
+| `decay` | 0.0 | Decay scale (0 = no decay) |
 
 ### Tuning `alpha` (Damping Factor)
 
@@ -422,13 +466,21 @@ CREATE TABLE memories (
 
 CREATE VIRTUAL TABLE memories_fts USING fts5(text, content=memories, content_rowid=id);
 
+-- Event-log style: multiple rows per pair allowed, summed for effective strength
 CREATE TABLE relationships (
     id INTEGER PRIMARY KEY,
     from_mem INTEGER NOT NULL,
     to_mem INTEGER NOT NULL,
-    created_at_mem INTEGER NOT NULL,
     strength REAL NOT NULL,
     CHECK (from_mem < to_mem)
+);
+
+-- Operation log for undo support
+CREATE TABLE operations (
+    id INTEGER PRIMARY KEY,
+    op_type TEXT NOT NULL,     -- 'add' or 'strengthen'
+    payload TEXT NOT NULL,     -- JSON with IDs for undo
+    created_at TEXT NOT NULL
 );
 ```
 
