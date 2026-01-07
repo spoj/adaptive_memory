@@ -8,9 +8,14 @@ An associative memory system using Personalized PageRank (PPR). Memories are sto
 Entries with `id`, `datetime`, `text`, and optional `source`. Stored in SQLite with FTS5 full-text indexing. IDs are sequential integers assigned on insertion.
 
 ### Relationships
-Symmetric connections between memories. Created only via explicit `strengthen` calls - no auto-generated relationships. Multiple strengthen events accumulate; effective strength is the sum of all events.
+Symmetric connections between memories. Created only via explicit `strengthen` calls - no auto-generated relationships.
 
-Relationships are stored canonically (`from_mem < to_mem`) as an event log. This allows strength to build up over time through repeated strengthening.
+Relationships are stored canonically (`from_mem < to_mem`) as an **event log**:
+- Each `strengthen` call inserts a new row with a strength value (CLI uses 1.0, library supports any float)
+- **Effective strength** between two memories = sum of all event strengths for that pair
+- **Degree** of a memory = count of unique neighbors (not event count)
+
+This design allows strength to build up over time through repeated strengthening, while degree-based penalties in PPR still count unique connections.
 
 ### Personalized PageRank (PPR)
 Search works by:
@@ -466,12 +471,14 @@ CREATE TABLE memories (
 
 CREATE VIRTUAL TABLE memories_fts USING fts5(text, content=memories, content_rowid=id);
 
--- Event-log style: multiple rows per pair allowed, summed for effective strength
+-- Event-log style: multiple rows per pair allowed
+-- Effective strength = SUM(strength) for each (from_mem, to_mem) pair
+-- Degree = COUNT(DISTINCT neighbor), not row count
 CREATE TABLE relationships (
     id INTEGER PRIMARY KEY,
     from_mem INTEGER NOT NULL,
     to_mem INTEGER NOT NULL,
-    strength REAL NOT NULL,
+    strength REAL NOT NULL,  -- can be any float (CLI uses 1.0)
     CHECK (from_mem < to_mem)
 );
 
