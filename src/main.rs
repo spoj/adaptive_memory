@@ -166,7 +166,7 @@ fn main() {
         from: cli.from,
         to: cli.to,
         decay: cli.decay.unwrap_or(0.0),
-        inhibit: cli.inhibit.unwrap_or(0.0),
+        inhibit: cli.inhibit.unwrap_or(100.0),
     };
 
     let result = if let Some(command) = cli.command {

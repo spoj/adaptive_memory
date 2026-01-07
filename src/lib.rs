@@ -105,7 +105,7 @@ impl Default for SearchParams {
             from: None,
             to: None,
             decay: 0.0,
-            inhibit: 0.0,
+            inhibit: 100.0,
         }
     }
 }
