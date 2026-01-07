@@ -58,6 +58,11 @@ struct Cli {
     #[arg(long, global = true)]
     decay: Option<f64>,
 
+    /// Inhibition scale for repeated edge strengthening. Higher = more suppression of
+    /// consecutive same-edge events. 0 = no inhibition.
+    #[arg(short, long, global = true)]
+    inhibit: Option<f64>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 
@@ -161,6 +166,7 @@ fn main() {
         from: cli.from,
         to: cli.to,
         decay: cli.decay.unwrap_or(0.0),
+        inhibit: cli.inhibit.unwrap_or(0.0),
     };
 
     let result = if let Some(command) = cli.command {

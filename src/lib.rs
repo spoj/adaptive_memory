@@ -90,6 +90,10 @@ pub struct SearchParams {
     /// Decay scale for relationship strength (power law).
     /// At age = decay, strength is halved. 0.0 means no decay.
     pub decay: f64,
+    /// Inhibition scale for repeated strengthening.
+    /// Controls how much repeated strengthening of the same edge is suppressed
+    /// based on intervening graph activity. 0.0 means no inhibition.
+    pub inhibit: f64,
 }
 
 impl Default for SearchParams {
@@ -101,6 +105,7 @@ impl Default for SearchParams {
             from: None,
             to: None,
             decay: 0.0,
+            inhibit: 0.0,
         }
     }
 }

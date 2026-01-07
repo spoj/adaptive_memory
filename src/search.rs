@@ -69,9 +69,12 @@ fn decay_strength(strength: f64, age: i64, decay_scale: f64) -> f64 {
 }
 
 impl Graph {
-    /// Load entire graph from database with optional decay.
-    /// decay_scale: at this age (in relationship event IDs), strength halves. 0 = no decay.
-    fn load(conn: &Connection, decay_scale: f64) -> Result<Self, MemoryError> {
+    /// Load entire graph from database with optional decay and inhibition.
+    ///
+    /// - decay_scale: at this age (in relationship event IDs), strength halves. 0 = no decay.
+    /// - inhibit_scale: controls suppression of repeated same-edge events. Higher = more
+    ///   suppression when same edge is strengthened with little intervening activity. 0 = no inhibition.
+    fn load(conn: &Connection, decay_scale: f64, inhibit_scale: f64) -> Result<Self, MemoryError> {
         let mut edges: HashMap<i64, Vec<(i64, f64)>> = HashMap::new();
         let mut out_weight: HashMap<i64, f64> = HashMap::new();
         let mut degree: HashMap<i64, usize> = HashMap::new();
@@ -85,11 +88,9 @@ impl Graph {
             )
             .unwrap_or(0);
 
-        // Step 1: Aggregate all relationships into undirected edges with summed strength
-        // We use (min(a,b), max(a,b)) as key to combine A->B and B->A
-        let mut combined_edges: HashMap<(i64, i64), f64> = HashMap::new();
-
-        let mut stmt = conn.prepare("SELECT id, from_mem, to_mem, strength FROM relationships")?;
+        // Step 1: Collect all relationship events ordered by ID
+        let mut stmt =
+            conn.prepare("SELECT id, from_mem, to_mem, strength FROM relationships ORDER BY id")?;
 
         let rows = stmt.query_map([], |row| {
             let id: i64 = row.get(0)?;
@@ -99,21 +100,47 @@ impl Graph {
             Ok((id, from, to, strength))
         })?;
 
+        // Step 2: Process events with inhibition
+        // For each edge, track the graph_strength when it was last seen
+        let mut combined_edges: HashMap<(i64, i64), f64> = HashMap::new();
+        let mut edge_last_seen: HashMap<(i64, i64), f64> = HashMap::new();
+        let mut graph_strength: f64 = 0.0;
+
         for row in rows {
-            let (id, from, to, strength) = row?;
+            let (id, from, to, raw_strength) = row?;
             if from == to {
                 continue;
             } // Skip self-loops
 
+            // Canonical edge key
+            let key = if from < to { (from, to) } else { (to, from) };
+
             // Apply decay based on relationship event age
             let age = max_rel_id - id;
-            let effective_strength = decay_strength(strength, age, decay_scale);
+            let decayed_strength = decay_strength(raw_strength, age, decay_scale);
 
-            let key = if from < to { (from, to) } else { (to, from) };
-            *combined_edges.entry(key).or_default() += effective_strength;
+            // Apply inhibition based on graph activity since last seen
+            let contribution = if inhibit_scale > 0.0 {
+                if let Some(&last_gs) = edge_last_seen.get(&key) {
+                    let gap = graph_strength - last_gs;
+                    decayed_strength * (1.0 - (-gap / inhibit_scale).exp())
+                } else {
+                    // First time seeing this edge - full credit
+                    decayed_strength
+                }
+            } else {
+                decayed_strength
+            };
+
+            // Update graph strength and edge tracking
+            graph_strength += contribution;
+            edge_last_seen.insert(key, graph_strength);
+
+            // Accumulate edge strength
+            *combined_edges.entry(key).or_default() += contribution;
         }
 
-        // Step 2: Build the graph structures from the aggregated undirected edges
+        // Step 3: Build the graph structures from the aggregated undirected edges
         for ((u, v), strength) in combined_edges {
             // Add to adjacency list for both directions
             edges.entry(u).or_default().push((v, strength));
@@ -354,7 +381,7 @@ pub(crate) fn surface_candidates(
     let seed_count = seeds.len();
 
     // Step 2: Load graph into memory (with optional decay)
-    let graph = Graph::load(conn, params.decay)?;
+    let graph = Graph::load(conn, params.decay, params.inhibit)?;
 
     // Step 3: Run PPR with degree penalty
     let (scores, iterations) = ppr(&graph, &seeds, params.alpha, params.beta);
@@ -430,7 +457,7 @@ pub(crate) fn find_related(
     let seed_count = seeds.len();
 
     // Load graph into memory (with optional decay)
-    let graph = Graph::load(conn, params.decay)?;
+    let graph = Graph::load(conn, params.decay, params.inhibit)?;
 
     // Run PPR with degree penalty
     let (scores, iterations) = ppr(&graph, &seeds, params.alpha, params.beta);
