@@ -35,7 +35,11 @@ struct Cli {
     tz: Option<TzOption>,
 
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
+
+    /// Quick access: ID, IDs (1,2,3), range (1-10), or with + suffix for related
+    #[arg(value_name = "SELECTOR")]
+    selector: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -181,12 +185,133 @@ fn main() {
         None => !cli.json, // default: local for text, utc for json
     };
 
-    let result = run(cli.command, &db_path, cli.json, use_local);
+    let result = if let Some(command) = cli.command {
+        run(command, &db_path, cli.json, use_local)
+    } else if let Some(selector) = cli.selector {
+        run_selector(&selector, &db_path, cli.json, use_local)
+    } else {
+        // No command and no selector - show help by running tail
+        run(Commands::Tail { n: 10 }, &db_path, cli.json, use_local)
+    };
 
     if let Err(e) = result {
         eprintln!("Error: {}", e);
         process::exit(1);
     }
+}
+
+/// Parse and execute a selector shorthand.
+///
+/// Formats:
+/// - `5` -> list --from 5 --to 5 (single memory)
+/// - `1,3,5,7` -> get memories 1, 3, 5, 7
+/// - `1-10` -> list --from 1 --to 10
+/// - `5+` -> related 5
+/// - `1,3,5+` -> related 1,3,5
+/// - `1-10+` -> list --from 1 --to 10, then related on all of them
+fn run_selector(
+    selector: &str,
+    db_path: &PathBuf,
+    json_output: bool,
+    use_local: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (selector, is_related) = if selector.ends_with('+') {
+        (&selector[..selector.len() - 1], true)
+    } else {
+        (selector, false)
+    };
+
+    // Parse the selector to get IDs
+    let ids = parse_selector(selector)?;
+
+    if is_related {
+        // Run related command with these IDs as seeds
+        let store = MemoryStore::open(db_path)?;
+        let params = SearchParams::default();
+        let result = store.related(&ids, &params)?;
+        if json_output {
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        } else {
+            println!(
+                "# {} results related to {:?} ({} activated, {} iters)\n",
+                result.memories.len(),
+                result.seeds,
+                result.total_activated,
+                result.iterations
+            );
+            for m in &result.memories {
+                let marker = if m.is_context {
+                    "~"
+                } else if m.is_seed {
+                    "*"
+                } else {
+                    "+"
+                };
+                print_memory_with_score(&m.memory, m.energy, marker, use_local);
+            }
+        }
+    } else {
+        // Just fetch and print these memories
+        let store = MemoryStore::open(db_path)?;
+        let memories = store.get_many(&ids)?;
+        if json_output {
+            let result = serde_json::json!({
+                "count": memories.len(),
+                "memories": memories
+            });
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        } else {
+            print_memories(&memories, use_local);
+        }
+    }
+
+    Ok(())
+}
+
+/// Parse a selector string into a list of IDs.
+///
+/// Formats:
+/// - `5` -> [5]
+/// - `1,3,5,7` -> [1, 3, 5, 7]
+/// - `1-10` -> [1, 2, 3, ..., 10]
+fn parse_selector(selector: &str) -> Result<Vec<i64>, MemoryError> {
+    // Check for range format (contains exactly one hyphen, not at start)
+    if selector.contains('-') && !selector.starts_with('-') {
+        let parts: Vec<&str> = selector.splitn(2, '-').collect();
+        if parts.len() == 2 {
+            let start: i64 = parts[0]
+                .trim()
+                .parse()
+                .map_err(|e| MemoryError::InvalidInput(format!("Invalid range start: {}", e)))?;
+            let end: i64 = parts[1]
+                .trim()
+                .parse()
+                .map_err(|e| MemoryError::InvalidInput(format!("Invalid range end: {}", e)))?;
+            if start > end {
+                return Err(MemoryError::InvalidInput(format!(
+                    "Range start {} is greater than end {}",
+                    start, end
+                )));
+            }
+            return Ok((start..=end).collect());
+        }
+    }
+
+    // Check for comma-separated IDs
+    if selector.contains(',') {
+        let ids: Result<Vec<i64>, _> = selector
+            .split(',')
+            .map(|s| s.trim().parse::<i64>())
+            .collect();
+        return ids.map_err(|e| MemoryError::InvalidInput(format!("Invalid ID: {}", e)));
+    }
+
+    // Single ID
+    let id: i64 = selector
+        .trim()
+        .parse()
+        .map_err(|e| MemoryError::InvalidInput(format!("Invalid ID: {}", e)))?;
+    Ok(vec![id])
 }
 
 fn run(
