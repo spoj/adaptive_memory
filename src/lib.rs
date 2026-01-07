@@ -124,4 +124,4 @@ pub use memory::{
 };
 pub use relationship::{Relationship, RelationshipEvent, StrengthenResult};
 pub use search::{ActivatedMemory, RelatedResult, SearchResult};
-pub use store::{MemoryStore, UndoResult};
+pub use store::{MemoryStore, UndoResult, UndoneMemory, UndoneRelationship};

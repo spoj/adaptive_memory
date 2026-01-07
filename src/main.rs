@@ -237,6 +237,37 @@ fn run(
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
                 println!("UNDONE: {}", result.description);
+
+                // Show full details for re-adding
+                if let Some(ref mem) = result.memory {
+                    println!("\nTo re-add this memory:");
+                    let source_arg = mem
+                        .source
+                        .as_ref()
+                        .map(|s| format!(" --source \"{}\"", s))
+                        .unwrap_or_default();
+                    println!(
+                        "  adaptive-memory add \"{}\" --datetime \"{}\"{}",
+                        mem.text.replace("\"", "\\\""),
+                        mem.datetime,
+                        source_arg
+                    );
+                }
+
+                if let Some(ref rels) = result.relationships {
+                    println!("\nUndone relationships:");
+                    for rel in rels {
+                        println!(
+                            "  {} <-> {} (strength: {:.1})",
+                            rel.from_mem, rel.to_mem, rel.strength
+                        );
+                    }
+                    if let Some(ref ids) = result.memory_ids {
+                        let ids_str: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+                        println!("\nTo re-add these relationships:");
+                        println!("  adaptive-memory strengthen {}", ids_str.join(","));
+                    }
+                }
             }
         }
 

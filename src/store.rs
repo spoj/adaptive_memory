@@ -22,15 +22,45 @@ use crate::{MAX_STRENGTHEN_SET, SearchParams};
 struct AddPayload {
     memory_id: i64,
     text: String,
+    /// RFC3339 datetime string
+    datetime: String,
+    source: Option<String>,
+}
+
+/// A single relationship event stored in the undo payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RelationshipEventPayload {
+    event_id: i64,
+    from_mem: i64,
+    to_mem: i64,
+    strength: f64,
 }
 
 /// Payload for a "strengthen" operation (for undo).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StrengthenPayload {
-    /// The relationship event IDs that were created.
-    event_ids: Vec<i64>,
+    /// The relationship events that were created (full details for re-adding).
+    events: Vec<RelationshipEventPayload>,
     /// The memory IDs that were strengthened (for display).
     memory_ids: Vec<i64>,
+}
+
+/// Details of an undone memory (for re-adding).
+#[derive(Debug, Clone, Serialize)]
+pub struct UndoneMemory {
+    pub id: i64,
+    pub text: String,
+    /// RFC3339 datetime string
+    pub datetime: String,
+    pub source: Option<String>,
+}
+
+/// Details of an undone relationship event (for re-adding).
+#[derive(Debug, Clone, Serialize)]
+pub struct UndoneRelationship {
+    pub from_mem: i64,
+    pub to_mem: i64,
+    pub strength: f64,
 }
 
 /// Result of an undo operation.
@@ -40,6 +70,15 @@ pub struct UndoResult {
     pub op_type: String,
     /// Human-readable description of what was undone.
     pub description: String,
+    /// Full details of the undone memory (only for "add" operations).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<UndoneMemory>,
+    /// Full details of the undone relationships (only for "strengthen" operations).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relationships: Option<Vec<UndoneRelationship>>,
+    /// Memory IDs that were involved in the strengthen (only for "strengthen" operations).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_ids: Option<Vec<i64>>,
 }
 
 /// The main interface for the adaptive memory system.
@@ -134,6 +173,8 @@ impl MemoryStore {
         let payload = AddPayload {
             memory_id: new_id,
             text: text.to_string(),
+            datetime: datetime_str_to_store.clone(),
+            source: source.map(|s| s.to_string()),
         };
         let payload_json = serde_json::to_string(&payload).map_err(|e| {
             MemoryError::InvalidInput(format!("Failed to serialize payload: {}", e))
@@ -208,7 +249,7 @@ impl MemoryStore {
         let tx = self.conn.transaction()?;
 
         let mut relationships = Vec::new();
-        let mut event_ids = Vec::new();
+        let mut events = Vec::new();
 
         // Generate all pairs and add a new event for each (1.0 strength per pair)
         for i in 0..ids.len() {
@@ -217,7 +258,12 @@ impl MemoryStore {
 
                 // Add new relationship event with 1.0 strength
                 let event_id = add_relationship_event(&tx, from_mem, to_mem, 1.0)?;
-                event_ids.push(event_id);
+                events.push(RelationshipEventPayload {
+                    event_id,
+                    from_mem,
+                    to_mem,
+                    strength: 1.0,
+                });
 
                 // Get the aggregated relationship (including the new event)
                 if let Some(rel) = get_relationship(&tx, from_mem, to_mem)? {
@@ -228,7 +274,7 @@ impl MemoryStore {
 
         // Log the operation for undo
         let payload = StrengthenPayload {
-            event_ids,
+            events,
             memory_ids: ids.to_vec(),
         };
         let payload_json = serde_json::to_string(&payload).map_err(|e| {
@@ -265,7 +311,7 @@ impl MemoryStore {
 
         let tx = self.conn.transaction()?;
 
-        let description = match op_type.as_str() {
+        let (description, memory, relationships, memory_ids) = match op_type.as_str() {
             "add" => {
                 let payload: AddPayload = serde_json::from_str(&payload_json).map_err(|e| {
                     MemoryError::InvalidInput(format!("Failed to parse add payload: {}", e))
@@ -290,7 +336,17 @@ impl MemoryStore {
                     payload.text.clone()
                 };
 
-                format!("add memory #{}: \"{}\"", payload.memory_id, display_text)
+                let description =
+                    format!("add memory #{}: \"{}\"", payload.memory_id, display_text);
+
+                let undone_memory = UndoneMemory {
+                    id: payload.memory_id,
+                    text: payload.text,
+                    datetime: payload.datetime,
+                    source: payload.source,
+                };
+
+                (description, Some(undone_memory), None, None)
             }
             "strengthen" => {
                 let payload: StrengthenPayload =
@@ -302,16 +358,36 @@ impl MemoryStore {
                     })?;
 
                 // Delete the specific relationship events
-                for event_id in &payload.event_ids {
-                    tx.execute("DELETE FROM relationships WHERE id = ?1", params![event_id])?;
+                for event in &payload.events {
+                    tx.execute(
+                        "DELETE FROM relationships WHERE id = ?1",
+                        params![event.event_id],
+                    )?;
                 }
 
                 let ids_str: Vec<String> =
                     payload.memory_ids.iter().map(|id| id.to_string()).collect();
-                format!(
+                let description = format!(
                     "strengthen {} relationships between memories [{}]",
-                    payload.event_ids.len(),
+                    payload.events.len(),
                     ids_str.join(", ")
+                );
+
+                let undone_relationships: Vec<UndoneRelationship> = payload
+                    .events
+                    .iter()
+                    .map(|e| UndoneRelationship {
+                        from_mem: e.from_mem,
+                        to_mem: e.to_mem,
+                        strength: e.strength,
+                    })
+                    .collect();
+
+                (
+                    description,
+                    None,
+                    Some(undone_relationships),
+                    Some(payload.memory_ids),
                 )
             }
             _ => {
@@ -333,6 +409,9 @@ impl MemoryStore {
         Ok(UndoResult {
             op_type,
             description,
+            memory,
+            relationships,
+            memory_ids,
         })
     }
 
