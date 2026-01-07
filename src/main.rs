@@ -46,7 +46,7 @@ struct Cli {
     #[arg(long, global = true)]
     to: Option<i64>,
 
-    /// PPR damping factor (0.85 = classic PageRank, lower = more weight to seeds)
+    /// PPR damping factor (default 0.7, classic PageRank uses 0.85)
     #[arg(short, long, global = true)]
     alpha: Option<f64>,
 
@@ -156,7 +156,7 @@ fn main() {
     // Build SearchParams from global options (limit handled per-context in run_selector)
     let params = SearchParams {
         limit: cli.limit.unwrap_or(DEFAULT_LIMIT),
-        alpha: cli.alpha.unwrap_or(0.85),
+        alpha: cli.alpha.unwrap_or(0.7),
         beta: cli.beta.unwrap_or(0.5),
         from: cli.from,
         to: cli.to,

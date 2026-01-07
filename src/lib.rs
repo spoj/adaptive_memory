@@ -76,7 +76,7 @@ pub const DEFAULT_LIMIT: usize = 10;
 pub struct SearchParams {
     /// Maximum number of results to return (also used as seed count).
     pub limit: usize,
-    /// PPR damping factor (alpha). Classic PageRank uses 0.85.
+    /// PPR damping factor (alpha). Default 0.7, classic PageRank uses 0.85.
     /// Higher values = more weight to graph structure, lower = more weight to seeds.
     pub alpha: f64,
     /// Degree penalty exponent (beta). Penalizes high-degree nodes.
@@ -96,7 +96,7 @@ impl Default for SearchParams {
     fn default() -> Self {
         Self {
             limit: DEFAULT_LIMIT,
-            alpha: 0.85,
+            alpha: 0.7,
             beta: 0.5,
             from: None,
             to: None,
