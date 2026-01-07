@@ -1,11 +1,22 @@
 use std::path::PathBuf;
 use std::process;
 
-use clap::{Parser, Subcommand};
+use chrono::{Local, TimeZone};
+use clap::{Parser, Subcommand, ValueEnum};
 
 use adaptive_memory::{
     DEFAULT_LIMIT, MAX_STRENGTHEN_SET, MemoryError, MemoryStore, SearchParams, default_db_path,
 };
+
+/// Timezone for datetime display
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+enum TzOption {
+    /// Use local timezone
+    #[default]
+    Local,
+    /// Use UTC (Zulu time)
+    Utc,
+}
 
 #[derive(Parser)]
 #[command(name = "adaptive-memory")]
@@ -18,6 +29,10 @@ struct Cli {
     /// Output in JSON format (default is compact text)
     #[arg(long, global = true)]
     json: bool,
+
+    /// Timezone for datetime display (default: local for text, utc for JSON)
+    #[arg(long, global = true, value_enum)]
+    tz: Option<TzOption>,
 
     #[command(subcommand)]
     command: Commands,
@@ -159,7 +174,14 @@ fn main() {
     let cli = Cli::parse();
     let db_path = cli.db.unwrap_or_else(default_db_path);
 
-    let result = run(cli.command, &db_path, cli.json);
+    // Determine timezone: explicit --tz wins, else local for text, utc for json
+    let use_local = match cli.tz {
+        Some(TzOption::Local) => true,
+        Some(TzOption::Utc) => false,
+        None => !cli.json, // default: local for text, utc for json
+    };
+
+    let result = run(cli.command, &db_path, cli.json, use_local);
 
     if let Err(e) = result {
         eprintln!("Error: {}", e);
@@ -171,6 +193,7 @@ fn run(
     command: Commands,
     db_path: &PathBuf,
     json_output: bool,
+    use_local: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         Commands::Init => {
@@ -203,7 +226,7 @@ fn run(
             if json_output {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
-                print_memory(&result.memory);
+                print_memory(&result.memory, use_local);
             }
         }
 
@@ -256,7 +279,7 @@ fn run(
                     } else {
                         "+"
                     };
-                    print_memory_with_score(&m.memory, m.energy, marker);
+                    print_memory_with_score(&m.memory, m.energy, marker, use_local);
                 }
             }
         }
@@ -301,7 +324,7 @@ fn run(
                     } else {
                         "+"
                     };
-                    print_memory_with_score(&m.memory, m.energy, marker);
+                    print_memory_with_score(&m.memory, m.energy, marker, use_local);
                 }
             }
         }
@@ -333,7 +356,7 @@ fn run(
                 });
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
-                print_memories(&memories);
+                print_memories(&memories, use_local);
             }
         }
 
@@ -347,7 +370,7 @@ fn run(
                 });
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
-                print_memories(&memories);
+                print_memories(&memories, use_local);
             }
         }
 
@@ -389,7 +412,7 @@ fn run(
                 });
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
-                print_memories(&memories);
+                print_memories(&memories, use_local);
             }
         }
 
@@ -475,25 +498,42 @@ fn parse_seed_ids(ids_str: &str) -> Result<Vec<i64>, MemoryError> {
     Ok(ids)
 }
 
+/// Format datetime based on timezone option
+fn format_datetime(dt: &chrono::DateTime<chrono::Utc>, use_local: bool) -> String {
+    if use_local {
+        Local
+            .from_utc_datetime(&dt.naive_utc())
+            .format("%Y-%m-%d %H:%M")
+            .to_string()
+    } else {
+        dt.format("%Y-%m-%d %H:%M").to_string()
+    }
+}
+
 /// Format a memory for text output (compact, no marker)
-fn print_memory(m: &adaptive_memory::Memory) {
+fn print_memory(m: &adaptive_memory::Memory, use_local: bool) {
     let source_str = m.source.as_deref().unwrap_or("-");
     println!(
         "--- Memory {} | {} | {} ---\n{}",
         m.id,
-        m.datetime.format("%Y-%m-%d %H:%M"),
+        format_datetime(&m.datetime, use_local),
         source_str,
         m.text
     );
 }
 
 /// Format a memory with score and marker for search output
-fn print_memory_with_score(m: &adaptive_memory::Memory, energy: f64, marker: &str) {
+fn print_memory_with_score(
+    m: &adaptive_memory::Memory,
+    energy: f64,
+    marker: &str,
+    use_local: bool,
+) {
     let source_str = m.source.as_deref().unwrap_or("-");
     println!(
         "--- Memory {} | {} | {} | {:.2}{} ---\n{}",
         m.id,
-        m.datetime.format("%Y-%m-%d %H:%M"),
+        format_datetime(&m.datetime, use_local),
         source_str,
         energy,
         marker,
@@ -502,8 +542,8 @@ fn print_memory_with_score(m: &adaptive_memory::Memory, energy: f64, marker: &st
 }
 
 /// Print a list of memories
-fn print_memories(memories: &[adaptive_memory::Memory]) {
+fn print_memories(memories: &[adaptive_memory::Memory], use_local: bool) {
     for m in memories {
-        print_memory(m);
+        print_memory(m, use_local);
     }
 }
