@@ -245,15 +245,7 @@ fn run_selector(
                 // Just list the range - unlimited by default, or explicit limit
                 let store = MemoryStore::open(db_path)?;
                 let memories = store.list(from, to, explicit_limit)?;
-                if json_output {
-                    let result = serde_json::json!({
-                        "count": memories.len(),
-                        "memories": memories
-                    });
-                    println!("{}", serde_json::to_string_pretty(&result)?);
-                } else {
-                    print_memories(&memories, use_local);
-                }
+                output_memories(&memories, json_output, use_local);
                 Ok(())
             }
         }
@@ -292,6 +284,19 @@ fn run_related_ids(
     Ok(())
 }
 
+/// Output a list of memories (JSON or text format)
+fn output_memories(memories: &[adaptive_memory::Memory], json_output: bool, use_local: bool) {
+    if json_output {
+        let result = serde_json::json!({
+            "count": memories.len(),
+            "memories": memories
+        });
+        println!("{}", serde_json::to_string_pretty(&result).unwrap());
+    } else {
+        print_memories(memories, use_local);
+    }
+}
+
 /// Fetch and print specific memory IDs
 fn run_get_ids(
     ids: &[i64],
@@ -301,15 +306,7 @@ fn run_get_ids(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let store = MemoryStore::open(db_path)?;
     let memories = store.get_many(ids)?;
-    if json_output {
-        let result = serde_json::json!({
-            "count": memories.len(),
-            "memories": memories
-        });
-        println!("{}", serde_json::to_string_pretty(&result)?);
-    } else {
-        print_memories(&memories, use_local);
-    }
+    output_memories(&memories, json_output, use_local);
     Ok(())
 }
 
@@ -486,44 +483,12 @@ fn run(
         }
 
         Commands::Search { query } => {
-            let store = MemoryStore::open(db_path)?;
-            let result = store.search(&query, params)?;
-            if json_output {
-                println!("{}", serde_json::to_string_pretty(&result)?);
-            } else {
-                println!(
-                    "# {} results for \"{}\" ({} activated, {} iters)\n",
-                    result.memories.len(),
-                    result.query,
-                    result.total_activated,
-                    result.iterations
-                );
-                for m in &result.memories {
-                    let marker = if m.is_seed { "*" } else { "+" };
-                    print_memory_with_score(&m.memory, m.energy, marker, use_local);
-                }
-            }
+            run_search(&query, db_path, json_output, use_local, params)?;
         }
 
         Commands::Related { ids } => {
             let seed_ids = parse_seed_ids(&ids)?;
-            let store = MemoryStore::open(db_path)?;
-            let result = store.related(&seed_ids, params)?;
-            if json_output {
-                println!("{}", serde_json::to_string_pretty(&result)?);
-            } else {
-                println!(
-                    "# {} results related to {:?} ({} activated, {} iters)\n",
-                    result.memories.len(),
-                    result.seeds,
-                    result.total_activated,
-                    result.iterations
-                );
-                for m in &result.memories {
-                    let marker = if m.is_seed { "*" } else { "+" };
-                    print_memory_with_score(&m.memory, m.energy, marker, use_local);
-                }
-            }
+            run_related_ids(&seed_ids, db_path, json_output, use_local, params)?;
         }
 
         Commands::Strengthen { ids } => {
@@ -546,29 +511,13 @@ fn run(
         Commands::Tail { n } => {
             let store = MemoryStore::open(db_path)?;
             let memories = store.tail(n)?;
-            if json_output {
-                let result = serde_json::json!({
-                    "count": memories.len(),
-                    "memories": memories
-                });
-                println!("{}", serde_json::to_string_pretty(&result)?);
-            } else {
-                print_memories(&memories, use_local);
-            }
+            output_memories(&memories, json_output, use_local);
         }
 
         Commands::List { from, to, limit } => {
             let store = MemoryStore::open(db_path)?;
             let memories = store.list(from, to, limit)?;
-            if json_output {
-                let result = serde_json::json!({
-                    "count": memories.len(),
-                    "memories": memories
-                });
-                println!("{}", serde_json::to_string_pretty(&result)?);
-            } else {
-                print_memories(&memories, use_local);
-            }
+            output_memories(&memories, json_output, use_local);
         }
 
         Commands::Stats => {
@@ -602,15 +551,7 @@ fn run(
         Commands::Stray { n } => {
             let store = MemoryStore::open(db_path)?;
             let memories = store.stray(n)?;
-            if json_output {
-                let result = serde_json::json!({
-                    "count": memories.len(),
-                    "memories": memories
-                });
-                println!("{}", serde_json::to_string_pretty(&result)?);
-            } else {
-                print_memories(&memories, use_local);
-            }
+            output_memories(&memories, json_output, use_local);
         }
 
         Commands::Timeline => {
