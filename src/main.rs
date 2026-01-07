@@ -209,20 +209,27 @@ fn main() {
 /// - `5+` -> related 5
 /// - `1,3,5+` -> related 1,3,5
 /// - `1-10+` -> list --from 1 --to 10, then related on all of them
+/// - anything else -> search query
 fn run_selector(
     selector: &str,
     db_path: &PathBuf,
     json_output: bool,
     use_local: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (selector, is_related) = if selector.ends_with('+') {
+    let (selector_part, is_related) = if selector.ends_with('+') {
         (&selector[..selector.len() - 1], true)
     } else {
         (selector, false)
     };
 
-    // Parse the selector to get IDs
-    let ids = parse_selector(selector)?;
+    // Try to parse as IDs, otherwise treat as search query
+    let ids = match parse_selector(selector_part) {
+        Some(ids) => ids,
+        None => {
+            // Not a valid selector, treat as search query
+            return run_search(selector, db_path, json_output, use_local);
+        }
+    };
 
     if is_related {
         // Run related command with these IDs as seeds
@@ -268,32 +275,59 @@ fn run_selector(
     Ok(())
 }
 
+/// Run a search query.
+fn run_search(
+    query: &str,
+    db_path: &PathBuf,
+    json_output: bool,
+    use_local: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let store = MemoryStore::open(db_path)?;
+    let params = SearchParams::default();
+    let result = store.search(query, &params)?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        println!(
+            "# {} results for \"{}\" ({} activated, {} iters)\n",
+            result.memories.len(),
+            result.query,
+            result.total_activated,
+            result.iterations
+        );
+        for m in &result.memories {
+            let marker = if m.is_context {
+                "~"
+            } else if m.is_seed {
+                "*"
+            } else {
+                "+"
+            };
+            print_memory_with_score(&m.memory, m.energy, marker, use_local);
+        }
+    }
+    Ok(())
+}
+
 /// Parse a selector string into a list of IDs.
 ///
 /// Formats:
 /// - `5` -> [5]
 /// - `1,3,5,7` -> [1, 3, 5, 7]
 /// - `1-10` -> [1, 2, 3, ..., 10]
-fn parse_selector(selector: &str) -> Result<Vec<i64>, MemoryError> {
+///
+/// Returns None if the string doesn't look like a valid selector (treated as search query).
+fn parse_selector(selector: &str) -> Option<Vec<i64>> {
     // Check for range format (contains exactly one hyphen, not at start)
     if selector.contains('-') && !selector.starts_with('-') {
         let parts: Vec<&str> = selector.splitn(2, '-').collect();
         if parts.len() == 2 {
-            let start: i64 = parts[0]
-                .trim()
-                .parse()
-                .map_err(|e| MemoryError::InvalidInput(format!("Invalid range start: {}", e)))?;
-            let end: i64 = parts[1]
-                .trim()
-                .parse()
-                .map_err(|e| MemoryError::InvalidInput(format!("Invalid range end: {}", e)))?;
+            let start: i64 = parts[0].trim().parse().ok()?;
+            let end: i64 = parts[1].trim().parse().ok()?;
             if start > end {
-                return Err(MemoryError::InvalidInput(format!(
-                    "Range start {} is greater than end {}",
-                    start, end
-                )));
+                return None;
             }
-            return Ok((start..=end).collect());
+            return Some((start..=end).collect());
         }
     }
 
@@ -303,15 +337,12 @@ fn parse_selector(selector: &str) -> Result<Vec<i64>, MemoryError> {
             .split(',')
             .map(|s| s.trim().parse::<i64>())
             .collect();
-        return ids.map_err(|e| MemoryError::InvalidInput(format!("Invalid ID: {}", e)));
+        return ids.ok();
     }
 
     // Single ID
-    let id: i64 = selector
-        .trim()
-        .parse()
-        .map_err(|e| MemoryError::InvalidInput(format!("Invalid ID: {}", e)))?;
-    Ok(vec![id])
+    let id: i64 = selector.trim().parse().ok()?;
+    Some(vec![id])
 }
 
 fn run(
