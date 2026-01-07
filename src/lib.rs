@@ -51,10 +51,6 @@ use serde::{Deserialize, Serialize};
 //
 // ### FTS limit (SearchParams.limit, default 10)
 // Only top N BM25 matches become seeds. User-configurable via --limit.
-//
-// ### Context expansion (--context N)
-// For each result, optionally fetch N memories before/after by ID.
-// This is like grep -B/-A for temporal context.
 
 /// Convergence threshold for PPR power iteration (L1 norm).
 pub const PPR_EPSILON: f64 = 1e-6;
@@ -87,9 +83,6 @@ pub struct SearchParams {
     /// 0.0 = no penalty, 0.5 = sqrt penalty, 1.0 = linear penalty.
     /// Higher values boost unique/rare connections over hub connections.
     pub beta: f64,
-    /// Context window: fetch N memories before/after each result (like grep -B/-A).
-    /// Set to 0 to disable context expansion.
-    pub context: usize,
     /// Filter results to memories with ID >= from (inclusive).
     pub from: Option<i64>,
     /// Filter results to memories with ID <= to (inclusive).
@@ -105,7 +98,6 @@ impl Default for SearchParams {
             limit: DEFAULT_LIMIT,
             alpha: 0.85,
             beta: 0.5,
-            context: 0,
             from: None,
             to: None,
             decay: 0.0,

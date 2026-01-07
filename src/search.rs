@@ -15,14 +15,11 @@ use crate::{PPR_EPSILON, PPR_MAX_ITER, SearchParams};
 pub struct ActivatedMemory {
     #[serde(flatten)]
     pub memory: Memory,
-    /// PPR score. 0.0 for context items.
+    /// PPR score.
     pub energy: f64,
     /// True if this was an initial FTS match or explicit seed ID.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub is_seed: bool,
-    /// True if this is a context item (fetched via --context, not by relevance).
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub is_context: bool,
 }
 
 /// Result of surface_candidates search.
@@ -376,26 +373,8 @@ pub(crate) fn surface_candidates(
 
     let total_activated = activated.len();
 
-    // Step 5: Expand context if requested
-    let activated_ids: HashSet<i64> = activated.iter().map(|(id, _)| *id).collect();
-    let mut context_ids: HashSet<i64> = HashSet::new();
-
-    if params.context > 0 {
-        for &(id, _) in &activated {
-            // Add IDs within context window (both before and after)
-            let start = (id - params.context as i64).max(1);
-            let end = id + params.context as i64;
-            for ctx_id in start..=end {
-                if ctx_id != id && !activated_ids.contains(&ctx_id) {
-                    context_ids.insert(ctx_id);
-                }
-            }
-        }
-    }
-
-    // Step 6: Fetch all memory objects (activated + context)
-    let mut all_ids: Vec<i64> = activated.iter().map(|(id, _)| *id).collect();
-    all_ids.extend(context_ids.iter());
+    // Fetch all memory objects
+    let all_ids: Vec<i64> = activated.iter().map(|(id, _)| *id).collect();
     let memories = get_memories_by_ids(conn, &all_ids)?;
 
     // Create a map for quick lookup
@@ -403,21 +382,16 @@ pub(crate) fn surface_candidates(
     let score_map: HashMap<i64, f64> = activated.into_iter().collect();
     let seed_set: HashSet<i64> = seeds.iter().map(|(id, _)| *id).collect();
 
-    // Build result: activated items with score, context items with score=0
+    // Build result
     let mut results: Vec<ActivatedMemory> = Vec::new();
 
     for id in all_ids {
         if let Some(mem) = memory_map.get(&id) {
-            let (energy, is_context) = if let Some(&e) = score_map.get(&id) {
-                (e, false)
-            } else {
-                (0.0, true)
-            };
+            let energy = score_map.get(&id).copied().unwrap_or(0.0);
             results.push(ActivatedMemory {
                 memory: mem.clone(),
                 energy,
                 is_seed: seed_set.contains(&id),
-                is_context,
             });
         }
     }
@@ -478,46 +452,24 @@ pub(crate) fn find_related(
 
     let total_activated = activated.len();
 
-    // Expand context if requested
-    let activated_ids: HashSet<i64> = activated.iter().map(|(id, _)| *id).collect();
-    let mut context_ids: HashSet<i64> = HashSet::new();
-
-    if params.context > 0 {
-        for &(id, _) in &activated {
-            let start = (id - params.context as i64).max(1);
-            let end = id + params.context as i64;
-            for ctx_id in start..=end {
-                if ctx_id != id && !activated_ids.contains(&ctx_id) && !seed_set.contains(&ctx_id) {
-                    context_ids.insert(ctx_id);
-                }
-            }
-        }
-    }
-
-    // Fetch all memory objects (activated + context)
-    let mut all_ids: Vec<i64> = activated.iter().map(|(id, _)| *id).collect();
-    all_ids.extend(context_ids.iter());
+    // Fetch all memory objects
+    let all_ids: Vec<i64> = activated.iter().map(|(id, _)| *id).collect();
     let memories = get_memories_by_ids(conn, &all_ids)?;
 
     // Create maps for quick lookup
     let memory_map: HashMap<i64, Memory> = memories.into_iter().map(|m| (m.id, m)).collect();
     let score_map: HashMap<i64, f64> = activated.into_iter().collect();
 
-    // Build result: activated items with score, context items with score=0
+    // Build result
     let mut results: Vec<ActivatedMemory> = Vec::new();
 
     for id in all_ids {
         if let Some(mem) = memory_map.get(&id) {
-            let (energy, is_context) = if let Some(&e) = score_map.get(&id) {
-                (e, false)
-            } else {
-                (0.0, true)
-            };
+            let energy = score_map.get(&id).copied().unwrap_or(0.0);
             results.push(ActivatedMemory {
                 memory: mem.clone(),
                 energy,
                 is_seed: seed_set.contains(&id),
-                is_context,
             });
         }
     }

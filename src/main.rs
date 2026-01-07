@@ -34,10 +34,34 @@ struct Cli {
     #[arg(long, global = true, value_enum)]
     tz: Option<TzOption>,
 
+    /// Maximum number of results to return
+    #[arg(short, long, global = true)]
+    limit: Option<usize>,
+
+    /// Filter results to memories with ID >= from (inclusive)
+    #[arg(long, global = true)]
+    from: Option<i64>,
+
+    /// Filter results to memories with ID <= to (inclusive)
+    #[arg(long, global = true)]
+    to: Option<i64>,
+
+    /// PPR damping factor (0.85 = classic PageRank, lower = more weight to seeds)
+    #[arg(short, long, global = true)]
+    alpha: Option<f64>,
+
+    /// Degree penalty (0 = none, 0.5 = sqrt, 1.0 = linear). Boosts unique links over hubs.
+    #[arg(short, long, global = true)]
+    beta: Option<f64>,
+
+    /// Decay scale for relationship strength (age at which strength halves). 0 = no decay.
+    #[arg(long, global = true)]
+    decay: Option<f64>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 
-    /// Quick access: ID, IDs (1,2,3), range (1-10), or with + suffix for related
+    /// Quick access: ID, IDs (1,2,3), range (1:10, 1:, :10), or with + suffix for related
     #[arg(value_name = "SELECTOR")]
     selector: Option<String>,
 }
@@ -68,68 +92,12 @@ enum Commands {
     Search {
         /// Search query (required, cannot be empty)
         query: String,
-
-        /// Maximum number of results to return (also used as seed count)
-        #[arg(short, long, default_value_t = DEFAULT_LIMIT)]
-        limit: usize,
-
-        /// PPR damping factor (0.85 = classic PageRank, lower = more weight to text matches)
-        #[arg(short, long, default_value_t = 0.85)]
-        alpha: f64,
-
-        /// Degree penalty (0 = none, 0.5 = sqrt, 1.0 = linear). Boosts unique links over hubs.
-        #[arg(short, long, default_value_t = 0.5)]
-        beta: f64,
-
-        /// Context window: fetch N memories before/after each result (like grep -B/-A)
-        #[arg(short, long, default_value_t = 0)]
-        context: usize,
-
-        /// Filter results to memories with ID >= from (inclusive)
-        #[arg(long)]
-        from: Option<i64>,
-
-        /// Filter results to memories with ID <= to (inclusive)
-        #[arg(long)]
-        to: Option<i64>,
-
-        /// Decay scale for relationship strength (age at which strength halves). 0 = no decay.
-        #[arg(long, default_value_t = 0.0)]
-        decay: f64,
     },
 
     /// Find memories related to seed IDs via graph (skips text search)
     Related {
         /// Comma-separated list of seed memory IDs
         ids: String,
-
-        /// Maximum number of results to return
-        #[arg(short, long, default_value_t = DEFAULT_LIMIT)]
-        limit: usize,
-
-        /// PPR damping factor (0.85 = classic PageRank, lower = more weight to seeds)
-        #[arg(short, long, default_value_t = 0.85)]
-        alpha: f64,
-
-        /// Degree penalty (0 = none, 0.5 = sqrt, 1.0 = linear). Boosts unique links over hubs.
-        #[arg(short, long, default_value_t = 0.5)]
-        beta: f64,
-
-        /// Context window: fetch N memories before/after each result (like grep -B/-A)
-        #[arg(short, long, default_value_t = 0)]
-        context: usize,
-
-        /// Filter results to memories with ID >= from (inclusive)
-        #[arg(long)]
-        from: Option<i64>,
-
-        /// Filter results to memories with ID <= to (inclusive)
-        #[arg(long)]
-        to: Option<i64>,
-
-        /// Decay scale for relationship strength (age at which strength halves). 0 = no decay.
-        #[arg(long, default_value_t = 0.0)]
-        decay: f64,
     },
 
     /// Strengthen relationships between memories (always adds, use undo to reverse)
@@ -185,13 +153,31 @@ fn main() {
         None => !cli.json, // default: local for text, utc for json
     };
 
+    // Build SearchParams from global options
+    let params = SearchParams {
+        limit: cli.limit.unwrap_or(DEFAULT_LIMIT),
+        alpha: cli.alpha.unwrap_or(0.85),
+        beta: cli.beta.unwrap_or(0.5),
+        from: cli.from,
+        to: cli.to,
+        decay: cli.decay.unwrap_or(0.0),
+    };
+
     let result = if let Some(command) = cli.command {
-        run(command, &db_path, cli.json, use_local)
+        run(command, &db_path, cli.json, use_local, &params)
     } else if let Some(selector) = cli.selector {
-        run_selector(&selector, &db_path, cli.json, use_local)
+        run_selector(&selector, &db_path, cli.json, use_local, &params)
     } else {
-        // No command and no selector - show help by running tail
-        run(Commands::Tail { n: 10 }, &db_path, cli.json, use_local)
+        // No command and no selector - show tail
+        run(
+            Commands::Tail {
+                n: cli.limit.unwrap_or(10),
+            },
+            &db_path,
+            cli.json,
+            use_local,
+            &params,
+        )
     };
 
     if let Err(e) = result {
@@ -203,18 +189,21 @@ fn main() {
 /// Parse and execute a selector shorthand.
 ///
 /// Formats:
-/// - `5` -> list --from 5 --to 5 (single memory)
-/// - `1,3,5,7` -> get memories 1, 3, 5, 7
-/// - `1-10` -> list --from 1 --to 10
+/// - `5` -> show memory #5
+/// - `1,3,5,7` -> show memories 1, 3, 5, 7
+/// - `1:10` -> list --from 1 --to 10
+/// - `1:` -> list --from 1
+/// - `:10` -> list --to 10
 /// - `5+` -> related 5
 /// - `1,3,5+` -> related 1,3,5
-/// - `1-10+` -> list --from 1 --to 10, then related on all of them
+/// - `1:10+` -> related on all IDs in range
 /// - anything else -> search query
 fn run_selector(
     selector: &str,
     db_path: &PathBuf,
     json_output: bool,
     use_local: bool,
+    params: &SearchParams,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (selector_part, is_related) = if selector.ends_with('+') {
         (&selector[..selector.len() - 1], true)
@@ -222,56 +211,101 @@ fn run_selector(
         (selector, false)
     };
 
-    // Try to parse as IDs, otherwise treat as search query
-    let ids = match parse_selector(selector_part) {
-        Some(ids) => ids,
-        None => {
-            // Not a valid selector, treat as search query
-            return run_search(selector, db_path, json_output, use_local);
-        }
-    };
+    // Try to parse as IDs/range, otherwise treat as search query
+    let parsed = parse_selector(selector_part);
 
-    if is_related {
-        // Run related command with these IDs as seeds
-        let store = MemoryStore::open(db_path)?;
-        let params = SearchParams::default();
-        let result = store.related(&ids, &params)?;
-        if json_output {
-            println!("{}", serde_json::to_string_pretty(&result)?);
-        } else {
-            println!(
-                "# {} results related to {:?} ({} activated, {} iters)\n",
-                result.memories.len(),
-                result.seeds,
-                result.total_activated,
-                result.iterations
-            );
-            for m in &result.memories {
-                let marker = if m.is_context {
-                    "~"
-                } else if m.is_seed {
-                    "*"
-                } else {
-                    "+"
-                };
-                print_memory_with_score(&m.memory, m.energy, marker, use_local);
+    match parsed {
+        Some(SelectorResult::Ids(ids)) => {
+            if is_related {
+                run_related_ids(&ids, db_path, json_output, use_local, params)
+            } else {
+                run_get_ids(&ids, db_path, json_output, use_local)
             }
         }
-    } else {
-        // Just fetch and print these memories
-        let store = MemoryStore::open(db_path)?;
-        let memories = store.get_many(&ids)?;
-        if json_output {
-            let result = serde_json::json!({
-                "count": memories.len(),
-                "memories": memories
-            });
-            println!("{}", serde_json::to_string_pretty(&result)?);
-        } else {
-            print_memories(&memories, use_local);
+        Some(SelectorResult::Range { from, to }) => {
+            if is_related {
+                // For range+, fetch IDs first then run related
+                let store = MemoryStore::open(db_path)?;
+                let memories = store.list(from, to, None)?;
+                let ids: Vec<i64> = memories.iter().map(|m| m.id).collect();
+                if ids.is_empty() {
+                    if json_output {
+                        println!("{{\"seeds\": [], \"memories\": []}}");
+                    } else {
+                        println!("# No memories in range");
+                    }
+                    return Ok(());
+                }
+                run_related_ids(&ids, db_path, json_output, use_local, params)
+            } else {
+                // Just list the range
+                let store = MemoryStore::open(db_path)?;
+                let memories = store.list(from, to, Some(params.limit))?;
+                if json_output {
+                    let result = serde_json::json!({
+                        "count": memories.len(),
+                        "memories": memories
+                    });
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                } else {
+                    print_memories(&memories, use_local);
+                }
+                Ok(())
+            }
+        }
+        None => {
+            // Not a valid selector, treat as search query
+            run_search(selector, db_path, json_output, use_local, params)
         }
     }
+}
 
+/// Run related command with given IDs
+fn run_related_ids(
+    ids: &[i64],
+    db_path: &PathBuf,
+    json_output: bool,
+    use_local: bool,
+    params: &SearchParams,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let store = MemoryStore::open(db_path)?;
+    let result = store.related(ids, params)?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        println!(
+            "# {} results related to {:?} ({} activated, {} iters)\n",
+            result.memories.len(),
+            result.seeds,
+            result.total_activated,
+            result.iterations
+        );
+        for m in &result.memories {
+            let marker = if m.is_seed { "*" } else { "+" };
+            print_memory_with_score(&m.memory, m.energy, marker, use_local);
+        }
+    }
+    Ok(())
+}
+
+/// Fetch and print specific memory IDs
+fn run_get_ids(
+    ids: &[i64],
+    db_path: &PathBuf,
+    json_output: bool,
+    use_local: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let store = MemoryStore::open(db_path)?;
+    let memories = store.get_many(ids)?;
+    if json_output {
+        let result = serde_json::json!({
+            "count": memories.len(),
+            "memories": memories
+        });
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else {
+        print_memories(&memories, use_local);
+    }
     Ok(())
 }
 
@@ -281,10 +315,10 @@ fn run_search(
     db_path: &PathBuf,
     json_output: bool,
     use_local: bool,
+    params: &SearchParams,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let store = MemoryStore::open(db_path)?;
-    let params = SearchParams::default();
-    let result = store.search(query, &params)?;
+    let result = store.search(query, params)?;
     if json_output {
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
@@ -296,38 +330,57 @@ fn run_search(
             result.iterations
         );
         for m in &result.memories {
-            let marker = if m.is_context {
-                "~"
-            } else if m.is_seed {
-                "*"
-            } else {
-                "+"
-            };
+            let marker = if m.is_seed { "*" } else { "+" };
             print_memory_with_score(&m.memory, m.energy, marker, use_local);
         }
     }
     Ok(())
 }
 
-/// Parse a selector string into a list of IDs.
+/// Result of parsing a selector
+enum SelectorResult {
+    /// Specific IDs (single or comma-separated)
+    Ids(Vec<i64>),
+    /// Range with optional bounds
+    Range { from: Option<i64>, to: Option<i64> },
+}
+
+/// Parse a selector string.
 ///
 /// Formats:
-/// - `5` -> [5]
-/// - `1,3,5,7` -> [1, 3, 5, 7]
-/// - `1-10` -> [1, 2, 3, ..., 10]
+/// - `5` -> Ids([5])
+/// - `1,3,5,7` -> Ids([1, 3, 5, 7])
+/// - `1:10` -> Range { from: Some(1), to: Some(10) }
+/// - `1:` -> Range { from: Some(1), to: None }
+/// - `:10` -> Range { from: None, to: Some(10) }
 ///
 /// Returns None if the string doesn't look like a valid selector (treated as search query).
-fn parse_selector(selector: &str) -> Option<Vec<i64>> {
-    // Check for range format (contains exactly one hyphen, not at start)
-    if selector.contains('-') && !selector.starts_with('-') {
-        let parts: Vec<&str> = selector.splitn(2, '-').collect();
+fn parse_selector(selector: &str) -> Option<SelectorResult> {
+    // Check for range format (contains colon)
+    if selector.contains(':') {
+        let parts: Vec<&str> = selector.splitn(2, ':').collect();
         if parts.len() == 2 {
-            let start: i64 = parts[0].trim().parse().ok()?;
-            let end: i64 = parts[1].trim().parse().ok()?;
-            if start > end {
+            let from_str = parts[0].trim();
+            let to_str = parts[1].trim();
+
+            let from: Option<i64> = if from_str.is_empty() {
+                None
+            } else {
+                Some(from_str.parse().ok()?)
+            };
+
+            let to: Option<i64> = if to_str.is_empty() {
+                None
+            } else {
+                Some(to_str.parse().ok()?)
+            };
+
+            // At least one bound must be specified
+            if from.is_none() && to.is_none() {
                 return None;
             }
-            return Some((start..=end).collect());
+
+            return Some(SelectorResult::Range { from, to });
         }
     }
 
@@ -337,12 +390,12 @@ fn parse_selector(selector: &str) -> Option<Vec<i64>> {
             .split(',')
             .map(|s| s.trim().parse::<i64>())
             .collect();
-        return ids.ok();
+        return ids.ok().map(SelectorResult::Ids);
     }
 
     // Single ID
     let id: i64 = selector.trim().parse().ok()?;
-    Some(vec![id])
+    Some(SelectorResult::Ids(vec![id]))
 }
 
 fn run(
@@ -350,6 +403,7 @@ fn run(
     db_path: &PathBuf,
     json_output: bool,
     use_local: bool,
+    params: &SearchParams,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match command {
         Commands::Init => {
@@ -427,27 +481,9 @@ fn run(
             }
         }
 
-        Commands::Search {
-            query,
-            limit,
-            alpha,
-            beta,
-            context,
-            from,
-            to,
-            decay,
-        } => {
+        Commands::Search { query } => {
             let store = MemoryStore::open(db_path)?;
-            let params = SearchParams {
-                limit,
-                alpha,
-                beta,
-                context,
-                from,
-                to,
-                decay,
-            };
-            let result = store.search(&query, &params)?;
+            let result = store.search(&query, params)?;
             if json_output {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
@@ -459,40 +495,16 @@ fn run(
                     result.iterations
                 );
                 for m in &result.memories {
-                    let marker = if m.is_context {
-                        "~"
-                    } else if m.is_seed {
-                        "*"
-                    } else {
-                        "+"
-                    };
+                    let marker = if m.is_seed { "*" } else { "+" };
                     print_memory_with_score(&m.memory, m.energy, marker, use_local);
                 }
             }
         }
 
-        Commands::Related {
-            ids,
-            limit,
-            alpha,
-            beta,
-            context,
-            from,
-            to,
-            decay,
-        } => {
+        Commands::Related { ids } => {
             let seed_ids = parse_seed_ids(&ids)?;
             let store = MemoryStore::open(db_path)?;
-            let params = SearchParams {
-                limit,
-                alpha,
-                beta,
-                context,
-                from,
-                to,
-                decay,
-            };
-            let result = store.related(&seed_ids, &params)?;
+            let result = store.related(&seed_ids, params)?;
             if json_output {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
@@ -504,13 +516,7 @@ fn run(
                     result.iterations
                 );
                 for m in &result.memories {
-                    let marker = if m.is_context {
-                        "~"
-                    } else if m.is_seed {
-                        "*"
-                    } else {
-                        "+"
-                    };
+                    let marker = if m.is_seed { "*" } else { "+" };
                     print_memory_with_score(&m.memory, m.energy, marker, use_local);
                 }
             }
