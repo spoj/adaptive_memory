@@ -163,19 +163,33 @@ impl Graph {
         })
     }
 
-    /// Get neighbors and their normalized transition probabilities with degree penalty.
-    /// Returns (neighbor_id, weight / total_out_weight, neighbor_degree).
-    fn neighbors(&self, node_id: i64) -> impl Iterator<Item = (i64, f64, usize)> + '_ {
-        let total = self.out_weight.get(&node_id).copied().unwrap_or(0.0);
-        self.edges
-            .get(&node_id)
-            .into_iter()
-            .flatten()
-            .map(move |&(neighbor, weight)| {
-                let prob = if total > 0.0 { weight / total } else { 0.0 };
-                let neighbor_degree = self.degree.get(&neighbor).copied().unwrap_or(1);
-                (neighbor, prob, neighbor_degree)
+    /// Get neighbors with locally-normalized transition probabilities.
+    ///
+    /// Applies degree penalty (beta) and normalizes so probabilities sum to 1.
+    /// Returns (neighbor_id, probability).
+    fn neighbors_with_beta(&self, node_id: i64, beta: f64) -> Vec<(i64, f64)> {
+        let edges = match self.edges.get(&node_id) {
+            Some(e) => e,
+            None => return vec![],
+        };
+
+        // Apply beta penalty: weight / degree^beta
+        let penalized: Vec<(i64, f64)> = edges
+            .iter()
+            .map(|&(neighbor, weight)| {
+                let degree = self.degree.get(&neighbor).copied().unwrap_or(1) as f64;
+                let penalized_weight = weight / degree.powf(beta);
+                (neighbor, penalized_weight)
             })
+            .collect();
+
+        // Local normalization
+        let total: f64 = penalized.iter().map(|(_, w)| w).sum();
+        if total <= 0.0 {
+            return vec![];
+        }
+
+        penalized.into_iter().map(|(n, w)| (n, w / total)).collect()
     }
 
     /// Check if a node is dangling (no outgoing edges).
@@ -288,10 +302,11 @@ fn get_memories_by_ids(conn: &Connection, ids: &[i64]) -> Result<Vec<Memory>, Me
 /// Personalized PageRank power iteration with degree penalty.
 ///
 /// Formula: score = (1 - α) * seed + α * P * score
-/// Where P is the transition matrix (normalized edge weights).
+/// Where P is the transition matrix with locally-normalized beta-penalized weights.
 ///
-/// Beta controls degree penalty: contribution is divided by neighbor_degree^beta.
-/// This boosts unique/rare connections over high-degree hub connections.
+/// Beta controls degree penalty on target nodes. Transition probabilities are
+/// penalized by target_degree^beta, then locally renormalized to sum to 1.
+/// This makes walkers prefer low-degree neighbors without losing energy.
 ///
 /// Dangling nodes (no outgoing edges) teleport their score back to seeds.
 fn ppr(graph: &Graph, seeds: &[(i64, f64)], alpha: f64, beta: f64) -> (HashMap<i64, f64>, usize) {
@@ -318,17 +333,17 @@ fn ppr(graph: &Graph, seeds: &[(i64, f64)], alpha: f64, beta: f64) -> (HashMap<i
         // Track dangling node score (nodes with no outgoing edges)
         let mut dangling_sum = 0.0;
 
-        // Propagate: α * Σ(score[node] * transition_prob / neighbor_degree^beta)
+        // Propagate: α * Σ(score[node] * transition_prob)
+        // transition_prob already has beta penalty applied and is locally normalized
         for (&node_id, &score) in &scores {
             if graph.is_dangling(node_id) {
                 // Dangling node: accumulate score for redistribution to seeds
                 dangling_sum += score;
             } else {
-                // Normal node: distribute score to neighbors with degree penalty
-                for (neighbor_id, prob, neighbor_degree) in graph.neighbors(node_id) {
-                    // Penalize high-degree neighbors: divide by degree^beta
-                    let degree_penalty = (neighbor_degree as f64).powf(beta);
-                    let contribution = alpha * score * prob / degree_penalty;
+                // Normal node: distribute score to neighbors
+                // Probabilities are already beta-penalized and locally normalized
+                for (neighbor_id, prob) in graph.neighbors_with_beta(node_id, beta) {
+                    let contribution = alpha * score * prob;
                     *new_scores.entry(neighbor_id).or_insert(0.0) += contribution;
                 }
             }
@@ -340,13 +355,7 @@ fn ppr(graph: &Graph, seeds: &[(i64, f64)], alpha: f64, beta: f64) -> (HashMap<i
             *new_scores.entry(*id).or_insert(0.0) += alpha * dangling_sum * seed_score;
         }
 
-        // Renormalize to maintain probability distribution (since degree penalty breaks it)
-        let total: f64 = new_scores.values().sum();
-        if total > 0.0 {
-            for score in new_scores.values_mut() {
-                *score /= total;
-            }
-        }
+        // No global renormalization needed - local normalization preserves probability mass
 
         // Check convergence (L1 norm of change)
         let diff: f64 = new_scores
