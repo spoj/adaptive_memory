@@ -20,8 +20,8 @@
 //!         println!("{}: {} (energy: {:.2})", mem.memory.id, mem.memory.text, mem.energy);
 //!     }
 //!
-//!     // Strengthen relationships
-//!     store.strengthen(&[1, 2])?;
+//!     // Link memories to create relationships
+//!     store.link(&[1, 2])?;
 //!
 //!     Ok(())
 //! }
@@ -58,7 +58,7 @@ pub const PPR_EPSILON: f64 = 1e-6;
 /// Maximum iterations for PPR power iteration.
 pub const PPR_MAX_ITER: usize = 100;
 
-/// Maximum number of memories that can be strengthened at once.
+/// Maximum number of memories that can be linked at once.
 pub const MAX_STRENGTHEN_SET: usize = 10;
 
 /// Default number of results to return from search.
@@ -90,8 +90,8 @@ pub struct SearchParams {
     /// Decay scale for relationship strength (power law).
     /// At age = decay, strength is halved. 0.0 means no decay.
     pub decay: f64,
-    /// Inhibition scale for repeated strengthening.
-    /// Controls how much repeated strengthening of the same edge is suppressed
+    /// Inhibition scale for repeated linking.
+    /// Controls how much repeated linking of the same edge is suppressed
     /// based on intervening graph activity. 0.0 means no inhibition.
     pub inhibit: f64,
 }
@@ -121,4 +121,6 @@ pub use memory::{
 };
 pub use relationship::{Relationship, RelationshipEvent, StrengthenResult};
 pub use search::{ActivatedMemory, RelatedResult, SearchResult};
-pub use store::{MemoryStore, UndoResult, UndoneMemory, UndoneRelationship};
+pub use store::{
+    MemoryStore, OpEntry, OpMemorySummary, UndoResult, UndoneMemory, UndoneRelationship,
+};

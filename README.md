@@ -8,14 +8,14 @@ An associative memory system using Personalized PageRank (PPR). Memories are sto
 Entries with `id`, `datetime`, `text`, and optional `source`. Stored in SQLite with FTS5 full-text indexing. IDs are sequential integers assigned on insertion.
 
 ### Relationships
-Symmetric connections between memories. Created only via explicit `strengthen` calls - no auto-generated relationships.
+Symmetric connections between memories. Created only via explicit `link` calls - no auto-generated relationships.
 
 Relationships are stored canonically (`from_mem < to_mem`) as an **event log**:
-- Each `strengthen` call inserts a new row with a strength value (CLI uses 1.0, library supports any float)
+- Each `link` call inserts a new row with a strength value (CLI uses 1.0, library supports any float)
 - **Effective strength** between two memories = sum of all event strengths for that pair
 - **Degree** of a memory = count of unique neighbors (not event count)
 
-This design allows strength to build up over time through repeated strengthening, while degree-based penalties in PPR still count unique connections.
+This design allows strength to build up over time through repeated linking, while degree-based penalties in PPR still count unique connections.
 
 ### Personalized PageRank (PPR)
 Search works by:
@@ -56,10 +56,11 @@ adaptive-memory [OPTIONS] <COMMAND>
 Commands:
   init        Initialize the database
   add         Add a new memory
-  undo        Undo the last operation (add or strengthen)
+  undo        Undo the last operation (add or link)
   search      Search for memories
   related     Find memories related to seed IDs via graph
-  strengthen  Strengthen relationships between memories
+  link        Link memories by creating relationships
+  ops         Show the latest N operations
   tail        Show the latest N memories
   list        List memories by ID range
   stats       Show database statistics
@@ -210,28 +211,28 @@ adaptive-memory related 42,38
 adaptive-memory related 42,38 --decay 1000
 ```
 
-### Strengthen Relationships
+### Link Memories
 
 Create explicit associations between memories. Always adds strength (use `undo` to reverse).
 
 ```bash
-adaptive-memory strengthen <IDS>
+adaptive-memory link <IDS>
 
 Arguments:
-  <IDS>  Comma-separated memory IDs (max 10)
+  <IDS>  Comma-separated memory IDs (2-10 IDs required)
 ```
 
 **Examples:**
 ```bash
 # Link two related memories (adds 1.0 strength)
-adaptive-memory strengthen 42,38
+adaptive-memory link 42,38
 
 # Link multiple (creates all pairs, 1.0 each)
 # 4 IDs = 6 pairs, each gets 1.0 strength
-adaptive-memory strengthen 1,5,12,34
+adaptive-memory link 1,5,12,34
 
 # Repeated calls accumulate strength
-adaptive-memory strengthen 42,38  # Now strength = 2.0
+adaptive-memory link 42,38  # Now strength = 2.0
 ```
 
 **Output:**
@@ -249,7 +250,7 @@ adaptive-memory strengthen 42,38  # Now strength = 2.0
 
 ### Undo
 
-Undo the last operation (`add` or `strengthen`). Works like a stack - can only undo the most recent operation.
+Undo the last operation (`add` or `link`). Works like a stack - can only undo the most recent operation.
 
 ```bash
 adaptive-memory undo
@@ -265,16 +266,42 @@ adaptive-memory add "Test memory"
 adaptive-memory undo
 # Output: UNDONE: add memory #42: "Test memory"
 
-# Strengthen some memories
-adaptive-memory strengthen 1,2,3
-# Output: STRENGTHENED 3 relationships
+# Link some memories
+adaptive-memory link 1,2,3
+# Output: LINKED 3 relationships
 
-# Undo the strengthen
+# Undo the link
 adaptive-memory undo
-# Output: UNDONE: strengthen 3 relationships between memories [1, 2, 3]
+# Output: UNDONE: link 3 relationships between memories [1, 2, 3]
 ```
 
 **Note**: Undo is append-only at the rear. You cannot undo operations from the middle of history - only the most recent operation can be undone.
+
+### Operations Log
+
+Show the latest N operations (add/link history) in human-readable form.
+
+```bash
+adaptive-memory ops [N]
+
+Arguments:
+  [N]  Number of operations to show (default: 10)
+```
+
+**Example:**
+```bash
+adaptive-memory ops 5
+```
+
+**Output:**
+```
+OPERATIONS (latest 5):
+  #123 | 2026-01-10 14:30 | add  | "Started learning Rust today..."
+  #122 | 2026-01-10 14:25 | link | [42, 38]
+                                    42: "Had coffee with Sarah..."
+                                    38: "Project kickoff meeting..."
+  #121 | 2026-01-10 14:20 | add  | "Reviewed PR #123 for the new..."
+```
 
 ### List Memories
 
@@ -415,8 +442,8 @@ fn main() -> Result<(), MemoryError> {
     };
     let results = store.search("activation", &params)?;
 
-    // Strengthen relationships
-    store.strengthen(&[1, 2, 3])?;
+    // Link memories to create relationships
+    store.link(&[1, 2, 3])?;
 
     Ok(())
 }
@@ -424,13 +451,25 @@ fn main() -> Result<(), MemoryError> {
 
 ## Configuration
 
+### Limits
+
+| Command | Default | Max | Notes |
+|---------|---------|-----|-------|
+| `tail N` | 10 | No hard limit | Limited by available memory |
+| `list --limit N` | All in range | No hard limit | Limited by available memory |
+| `search --limit N` | 10 | No hard limit | Also controls FTS seed count |
+| `stray N` | 10 | No hard limit | Limited by available memory |
+| `link <IDS>` | - | **10 IDs max** | Creates N*(N-1)/2 pairs |
+| `related <IDS>` | - | No hard limit | Seed IDs for graph traversal |
+| `ops N` | 10 | No hard limit | Limited by operation history |
+
 ### Compile-time Constants (`src/lib.rs`)
 
 | Constant | Default | Description |
 |----------|---------|-------------|
 | `PPR_EPSILON` | 1e-6 | Convergence threshold for PPR iteration |
 | `PPR_MAX_ITER` | 100 | Maximum PPR iterations |
-| `MAX_STRENGTHEN_SET` | 10 | Max memories per strengthen call |
+| `MAX_STRENGTHEN_SET` | 10 | Max memories per link call |
 | `DEFAULT_LIMIT` | 10 | Default result limit |
 
 ### Runtime Parameters (`SearchParams`)
@@ -485,7 +524,7 @@ CREATE TABLE relationships (
 -- Operation log for undo support
 CREATE TABLE operations (
     id INTEGER PRIMARY KEY,
-    op_type TEXT NOT NULL,     -- 'add' or 'strengthen'
+    op_type TEXT NOT NULL,     -- 'add' or 'link'
     payload TEXT NOT NULL,     -- JSON with IDs for undo
     created_at TEXT NOT NULL
 );
@@ -496,7 +535,7 @@ CREATE TABLE operations (
 ### Adding a Memory
 1. Insert into `memories` table
 2. FTS5 trigger auto-indexes the text
-3. No relationships created (use `strengthen` or `--context` for associations)
+3. No relationships created (use `link` or `--context` for associations)
 
 ### Searching
 1. **FTS5**: BM25-ranked text matches become seeds (normalized to sum to 1.0)
@@ -508,15 +547,15 @@ CREATE TABLE operations (
 3. **Context Expansion**: Optionally fetch surrounding memories by ID
 4. **Results**: Sorted by PPR score (highest first)
 
-### Strengthening
+### Linking
 1. For each pair of IDs, add relationship event with strength 1.0
-2. Events accumulate - the pair's effective strength grows with repeated strengthening
+2. Events accumulate - the pair's effective strength grows with repeated linking
 3. Higher strength → higher transition probability in PPR (normalized by out-degree)
 
 ## Tips
 
 - **Source field**: Tag memories for filtering/identification (e.g., "slack", "journal", "calendar")
-- **Strengthen after retrieval**: If a search surfaces related memories, strengthen them to reinforce the association
+- **Link after retrieval**: If a search surfaces related memories, link them to reinforce the association
 - **Context for temporal**: Use `--context N` instead of pre-computed temporal links
 - **Batch import**: Use `-d` to preserve original timestamps when importing historical data
 - **Quote special chars**: FTS5 special characters (`+`, `-`, `*`, etc.) should be quoted for literal matching

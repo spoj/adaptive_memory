@@ -36,12 +36,13 @@ struct RelationshipEventPayload {
     strength: f64,
 }
 
-/// Payload for a "strengthen" operation (for undo).
+/// Payload for a "link" operation (for undo).
+/// Note: Also handles legacy "strengthen" operations for backward compatibility.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct StrengthenPayload {
+struct LinkPayload {
     /// The relationship events that were created (full details for re-adding).
     events: Vec<RelationshipEventPayload>,
-    /// The memory IDs that were strengthened (for display).
+    /// The memory IDs that were linked (for display).
     memory_ids: Vec<i64>,
 }
 
@@ -66,25 +67,50 @@ pub struct UndoneRelationship {
 /// Result of an undo operation.
 #[derive(Debug, Serialize)]
 pub struct UndoResult {
-    /// Type of operation that was undone ("add" or "strengthen").
+    /// Type of operation that was undone ("add" or "link").
     pub op_type: String,
     /// Human-readable description of what was undone.
     pub description: String,
     /// Full details of the undone memory (only for "add" operations).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory: Option<UndoneMemory>,
-    /// Full details of the undone relationships (only for "strengthen" operations).
+    /// Full details of the undone relationships (only for "link" operations).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub relationships: Option<Vec<UndoneRelationship>>,
-    /// Memory IDs that were involved in the strengthen (only for "strengthen" operations).
+    /// Memory IDs that were involved in the link (only for "link" operations).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_ids: Option<Vec<i64>>,
+}
+
+/// A memory summary for operations log display.
+#[derive(Debug, Clone, Serialize)]
+pub struct OpMemorySummary {
+    pub id: i64,
+    /// Truncated text (50 chars or first line, whichever shorter)
+    pub text: String,
+}
+
+/// An entry in the operations log.
+#[derive(Debug, Serialize)]
+pub struct OpEntry {
+    /// Operation ID
+    pub id: i64,
+    /// Operation type ("add" or "link")
+    pub op_type: String,
+    /// When the operation was performed (RFC3339)
+    pub created_at: String,
+    /// For "add" ops: the memory that was added
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<OpMemorySummary>,
+    /// For "link" ops: the memories that were linked
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memories: Option<Vec<OpMemorySummary>>,
 }
 
 /// The main interface for the adaptive memory system.
 ///
 /// Wraps a SQLite connection and provides methods for adding, searching,
-/// and strengthening memories. Caches the maximum memory ID for relationship
+/// and linking memories. Caches the maximum memory ID for relationship
 /// event timestamps.
 pub struct MemoryStore {
     conn: Connection,
@@ -124,7 +150,7 @@ impl MemoryStore {
 
     /// Add a new memory.
     ///
-    /// Note: No temporal relationships are created. Use strengthen() to create
+    /// Note: No temporal relationships are created. Use link() to create
     /// explicit relationships, or --context flag at search time for temporal context.
     pub fn add(
         &mut self,
@@ -219,16 +245,16 @@ impl MemoryStore {
         find_related(&self.conn, seed_ids, params)
     }
 
-    /// Strengthen relationships between a set of memory IDs.
+    /// Link memories by creating relationships between them.
     ///
     /// Adds a new explicit relationship event for each pair with strength 1.0.
     /// Repeated calls accumulate strength.
     ///
     /// This operation is wrapped in a transaction for atomicity.
-    pub fn strengthen(&mut self, ids: &[i64]) -> Result<StrengthenResult, MemoryError> {
+    pub fn link(&mut self, ids: &[i64]) -> Result<StrengthenResult, MemoryError> {
         if ids.len() > MAX_STRENGTHEN_SET {
             return Err(MemoryError::InvalidInput(format!(
-                "Cannot strengthen more than {} memories at once (got {})",
+                "Cannot link more than {} memories at once (got {})",
                 MAX_STRENGTHEN_SET,
                 ids.len()
             )));
@@ -273,7 +299,7 @@ impl MemoryStore {
         }
 
         // Log the operation for undo
-        let payload = StrengthenPayload {
+        let payload = LinkPayload {
             events,
             memory_ids: ids.to_vec(),
         };
@@ -283,7 +309,7 @@ impl MemoryStore {
 
         tx.execute(
             "INSERT INTO operations (op_type, payload, created_at) VALUES (?1, ?2, ?3)",
-            params!["strengthen", payload_json, Utc::now().to_rfc3339()],
+            params!["link", payload_json, Utc::now().to_rfc3339()],
         )?;
 
         tx.commit()?;
@@ -291,11 +317,11 @@ impl MemoryStore {
         Ok(StrengthenResult { relationships })
     }
 
-    /// Undo the last operation (add or strengthen).
+    /// Undo the last operation (add or link).
     ///
     /// This pops the most recent operation from the stack and reverses it:
     /// - For "add": deletes the memory and any relationships pointing to it
-    /// - For "strengthen": deletes the relationship events that were created
+    /// - For "link": deletes the relationship events that were created
     ///
     /// Returns an error if there are no operations to undo.
     pub fn undo(&mut self) -> Result<UndoResult, MemoryError> {
@@ -348,14 +374,11 @@ impl MemoryStore {
 
                 (description, Some(undone_memory), None, None)
             }
-            "strengthen" => {
-                let payload: StrengthenPayload =
-                    serde_json::from_str(&payload_json).map_err(|e| {
-                        MemoryError::InvalidInput(format!(
-                            "Failed to parse strengthen payload: {}",
-                            e
-                        ))
-                    })?;
+            // Handle both "link" (new) and "strengthen" (legacy) operations
+            "link" | "strengthen" => {
+                let payload: LinkPayload = serde_json::from_str(&payload_json).map_err(|e| {
+                    MemoryError::InvalidInput(format!("Failed to parse link payload: {}", e))
+                })?;
 
                 // Delete the specific relationship events
                 for event in &payload.events {
@@ -368,7 +391,7 @@ impl MemoryStore {
                 let ids_str: Vec<String> =
                     payload.memory_ids.iter().map(|id| id.to_string()).collect();
                 let description = format!(
-                    "strengthen {} relationships between memories [{}]",
+                    "link {} relationships between memories [{}]",
                     payload.events.len(),
                     ids_str.join(", ")
                 );
@@ -710,6 +733,98 @@ impl MemoryStore {
         Ok(Timeline { buckets, summary })
     }
 
+    /// Get the latest N operations from the operations log.
+    ///
+    /// Returns operations in reverse chronological order (newest first).
+    /// For "add" operations, includes the memory text (truncated).
+    /// For "link" operations, includes all linked memory texts (truncated).
+    pub fn ops(&self, n: usize) -> Result<Vec<OpEntry>, MemoryError> {
+        // Query operations ordered by ID descending
+        let mut stmt = self.conn.prepare(
+            "SELECT id, op_type, payload, created_at FROM operations ORDER BY id DESC LIMIT ?1",
+        )?;
+
+        let rows = stmt.query_map(params![n as i64], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+
+        let mut entries = Vec::new();
+
+        for row in rows {
+            let (id, op_type, payload_json, created_at) = row?;
+
+            let (memory, memories) = match op_type.as_str() {
+                "add" => {
+                    let payload: AddPayload = serde_json::from_str(&payload_json).map_err(|e| {
+                        MemoryError::InvalidInput(format!("Failed to parse add payload: {}", e))
+                    })?;
+
+                    let summary = OpMemorySummary {
+                        id: payload.memory_id,
+                        text: Self::truncate_text(&payload.text),
+                    };
+
+                    (Some(summary), None)
+                }
+                // Handle both "link" (new) and "strengthen" (legacy)
+                "link" | "strengthen" => {
+                    let payload: LinkPayload =
+                        serde_json::from_str(&payload_json).map_err(|e| {
+                            MemoryError::InvalidInput(format!(
+                                "Failed to parse link payload: {}",
+                                e
+                            ))
+                        })?;
+
+                    // Fetch the memory texts for all involved IDs
+                    let mems = self.get_many(&payload.memory_ids)?;
+
+                    // Create a map for quick lookup
+                    let mem_map: std::collections::HashMap<i64, String> =
+                        mems.into_iter().map(|m| (m.id, m.text)).collect();
+
+                    // Build summaries in the order of memory_ids
+                    let summaries: Vec<OpMemorySummary> = payload
+                        .memory_ids
+                        .iter()
+                        .map(|&id| {
+                            let text = mem_map
+                                .get(&id)
+                                .map(|t| Self::truncate_text(t))
+                                .unwrap_or_else(|| format!("[deleted memory {}]", id));
+                            OpMemorySummary { id, text }
+                        })
+                        .collect();
+
+                    (None, Some(summaries))
+                }
+                _ => (None, None),
+            };
+
+            // Normalize op_type for display (convert legacy "strengthen" to "link")
+            let display_op_type = if op_type == "strengthen" {
+                "link".to_string()
+            } else {
+                op_type
+            };
+
+            entries.push(OpEntry {
+                id,
+                op_type: display_op_type,
+                created_at,
+                memory,
+                memories,
+            });
+        }
+
+        Ok(entries)
+    }
+
     /// Get multiple memories by their IDs.
     pub fn get_many(&self, ids: &[i64]) -> Result<Vec<Memory>, MemoryError> {
         if ids.is_empty() {
@@ -748,6 +863,21 @@ impl MemoryStore {
     // ========================================================================
     // Internal helpers
     // ========================================================================
+
+    /// Truncate text to 50 chars or first newline, whichever is shorter.
+    fn truncate_text(text: &str) -> String {
+        // Find first newline
+        let first_line = text.lines().next().unwrap_or(text);
+
+        if first_line.len() > 50 {
+            format!("{}...", &first_line[..50])
+        } else if first_line.len() < text.len() {
+            // There was a newline, indicate continuation
+            format!("{}...", first_line)
+        } else {
+            first_line.to_string()
+        }
+    }
 
     /// Convert a row to a Memory struct.
     fn row_to_memory(row: &rusqlite::Row) -> Result<Memory, rusqlite::Error> {
@@ -822,7 +952,7 @@ mod tests {
     }
 
     #[test]
-    fn test_strengthen() {
+    fn test_link() {
         let mut store = MemoryStore::open_in_memory().unwrap();
 
         // Add some memories (no temporal relationships created)
@@ -830,8 +960,8 @@ mod tests {
         store.add("mem2", None).unwrap();
         store.add("mem3", None).unwrap();
 
-        // Strengthen memories 1, 2, 3 - creates 1.0 strength for each pair
-        let result = store.strengthen(&[1, 2, 3]).unwrap();
+        // Link memories 1, 2, 3 - creates 1.0 strength for each pair
+        let result = store.link(&[1, 2, 3]).unwrap();
         assert_eq!(result.relationships.len(), 3);
 
         // Each relationship should have 1 event with strength 1.0
@@ -839,28 +969,28 @@ mod tests {
             assert!((rel.effective_strength - 1.0).abs() < 0.001);
         }
 
-        // Strengthen just 2 memories again - adds another 1.0 event
-        let result = store.strengthen(&[1, 2]).unwrap();
+        // Link just 2 memories again - adds another 1.0 event
+        let result = store.link(&[1, 2]).unwrap();
         assert_eq!(result.relationships.len(), 1);
         assert!((result.relationships[0].effective_strength - 2.0).abs() < 0.001);
         // 2.0 total
     }
 
     #[test]
-    fn test_strengthen_validation() {
+    fn test_link_validation() {
         let mut store = MemoryStore::open_in_memory().unwrap();
 
         // Empty list
-        let err = store.strengthen(&[]).unwrap_err();
+        let err = store.link(&[]).unwrap_err();
         assert!(matches!(err, MemoryError::InvalidInput(_)));
 
         // Single ID
-        let err = store.strengthen(&[1]).unwrap_err();
+        let err = store.link(&[1]).unwrap_err();
         assert!(matches!(err, MemoryError::InvalidInput(_)));
 
         // Too many IDs
         let ids: Vec<i64> = (1..=15).collect();
-        let err = store.strengthen(&ids).unwrap_err();
+        let err = store.link(&ids).unwrap_err();
         assert!(matches!(err, MemoryError::InvalidInput(_)));
     }
 
@@ -976,8 +1106,8 @@ mod tests {
         assert_eq!(stats.graph.largest_island_size, 0);
 
         // Add relationships
-        store.strengthen(&[1, 2]).unwrap();
-        store.strengthen(&[1, 2, 3]).unwrap(); // adds events for (1,2), (1,3), (2,3)
+        store.link(&[1, 2]).unwrap();
+        store.link(&[1, 2, 3]).unwrap(); // adds events for (1,2), (1,3), (2,3)
 
         let stats = store.stats().unwrap();
         assert_eq!(stats.relationship_count, 3); // unique pairs: (1,2), (1,3), (2,3)
@@ -1020,7 +1150,7 @@ mod tests {
     }
 
     #[test]
-    fn test_undo_strengthen() {
+    fn test_undo_link() {
         let mut store = MemoryStore::open_in_memory().unwrap();
 
         // Add memories
@@ -1028,8 +1158,8 @@ mod tests {
         store.add("mem2", None).unwrap();
         store.add("mem3", None).unwrap();
 
-        // Strengthen creates relationships
-        let result = store.strengthen(&[1, 2, 3]).unwrap();
+        // Link creates relationships
+        let result = store.link(&[1, 2, 3]).unwrap();
         assert_eq!(result.relationships.len(), 3);
 
         // Verify relationships exist
@@ -1037,9 +1167,9 @@ mod tests {
         assert_eq!(stats.relationship_count, 3);
         assert_eq!(stats.relationship_event_count, 3);
 
-        // Undo the strengthen
+        // Undo the link
         let undo_result = store.undo().unwrap();
-        assert_eq!(undo_result.op_type, "strengthen");
+        assert_eq!(undo_result.op_type, "link");
         assert!(undo_result.description.contains("3 relationships"));
 
         // Verify relationships are gone
@@ -1061,12 +1191,12 @@ mod tests {
         store.add("First memory", None).unwrap();
         store.add("Second memory", None).unwrap();
 
-        // Strengthen
-        store.strengthen(&[1, 2]).unwrap();
+        // Link
+        store.link(&[1, 2]).unwrap();
 
-        // Undo strengthen first
+        // Undo link first
         let undo_result = store.undo().unwrap();
-        assert_eq!(undo_result.op_type, "strengthen");
+        assert_eq!(undo_result.op_type, "link");
 
         // Undo second add
         let undo_result = store.undo().unwrap();
@@ -1091,22 +1221,22 @@ mod tests {
         store.add("mem1", None).unwrap();
         store.add("mem2", None).unwrap();
 
-        // Strengthen to create relationship
-        store.strengthen(&[1, 2]).unwrap();
+        // Link to create relationship
+        store.link(&[1, 2]).unwrap();
 
         // Add another memory
         store.add("mem3", None).unwrap();
 
-        // Strengthen 2 and 3
-        store.strengthen(&[2, 3]).unwrap();
+        // Link 2 and 3
+        store.link(&[2, 3]).unwrap();
 
-        // Undo last strengthen
+        // Undo last link
         store.undo().unwrap();
 
         // Undo add of mem3
         store.undo().unwrap();
 
-        // Now undo the first strengthen
+        // Now undo the first link
         store.undo().unwrap();
 
         // Undo add of mem2 - should also remove any dangling relationship refs

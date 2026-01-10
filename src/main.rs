@@ -58,7 +58,7 @@ struct Cli {
     #[arg(long, global = true)]
     decay: Option<f64>,
 
-    /// Inhibition scale for repeated edge strengthening. Higher = more suppression of
+    /// Inhibition scale for repeated edge linking. Higher = more suppression of
     /// consecutive same-edge events. 0 = no inhibition.
     #[arg(short, long, global = true)]
     inhibit: Option<f64>,
@@ -90,7 +90,7 @@ enum Commands {
         datetime: Option<String>,
     },
 
-    /// Undo the last operation (add or strengthen)
+    /// Undo the last operation (add or link)
     Undo,
 
     /// Search for memories using text query and Personalized PageRank
@@ -105,10 +105,17 @@ enum Commands {
         ids: String,
     },
 
-    /// Strengthen relationships between memories (always adds, use undo to reverse)
-    Strengthen {
-        /// Comma-separated list of memory IDs (max 10)
+    /// Link memories by creating relationships between them (max 10 IDs, use undo to reverse)
+    Link {
+        /// Comma-separated list of memory IDs (2-10 IDs required)
         ids: String,
+    },
+
+    /// Show the latest N operations (add/link history)
+    Ops {
+        /// Number of operations to show (default: 10)
+        #[arg(default_value_t = 10)]
+        n: usize,
     },
 
     /// Show the latest N memories (shorthand for list --limit N)
@@ -482,7 +489,7 @@ fn run(
                     if let Some(ref ids) = result.memory_ids {
                         let ids_str: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
                         println!("\nTo re-add these relationships:");
-                        println!("  adaptive-memory strengthen {}", ids_str.join(","));
+                        println!("  adaptive-memory link {}", ids_str.join(","));
                     }
                 }
             }
@@ -497,19 +504,72 @@ fn run(
             run_related_ids(&seed_ids, db_path, json_output, use_local, params)?;
         }
 
-        Commands::Strengthen { ids } => {
+        Commands::Link { ids } => {
             let ids = parse_ids(&ids)?;
             let mut store = MemoryStore::open(db_path)?;
-            let result = store.strengthen(&ids)?;
+            let result = store.link(&ids)?;
             if json_output {
                 println!("{}", serde_json::to_string_pretty(&result)?);
             } else {
-                println!("STRENGTHENED {} relationships:", result.relationships.len());
+                println!("LINKED {} relationships:", result.relationships.len());
                 for r in &result.relationships {
                     println!(
                         "  {} <-> {} (strength: {:.1})",
                         r.from_mem, r.to_mem, r.effective_strength
                     );
+                }
+            }
+        }
+
+        Commands::Ops { n } => {
+            let store = MemoryStore::open(db_path)?;
+            let entries = store.ops(n)?;
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&entries)?);
+            } else {
+                if entries.is_empty() {
+                    println!("No operations yet.");
+                } else {
+                    println!("OPERATIONS (latest {}):", entries.len());
+                    for entry in &entries {
+                        // Parse created_at to display nicely
+                        let created = chrono::DateTime::parse_from_rfc3339(&entry.created_at)
+                            .map(|dt| format_datetime(&dt.with_timezone(&chrono::Utc), use_local))
+                            .unwrap_or_else(|_| entry.created_at.clone());
+
+                        match entry.op_type.as_str() {
+                            "add" => {
+                                if let Some(ref mem) = entry.memory {
+                                    println!(
+                                        "  #{:<4} | {} | {:<4} | \"{}\"",
+                                        entry.id, created, "add", mem.text
+                                    );
+                                }
+                            }
+                            "link" => {
+                                if let Some(ref mems) = entry.memories {
+                                    let ids: Vec<String> =
+                                        mems.iter().map(|m| m.id.to_string()).collect();
+                                    println!(
+                                        "  #{:<4} | {} | {:<4} | [{}]",
+                                        entry.id,
+                                        created,
+                                        "link",
+                                        ids.join(", ")
+                                    );
+                                    for mem in mems {
+                                        println!(
+                                            "         {:>17}     {}: \"{}\"",
+                                            "", mem.id, mem.text
+                                        );
+                                    }
+                                }
+                            }
+                            _ => {
+                                println!("  #{:<4} | {} | {}", entry.id, created, entry.op_type);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -615,7 +675,7 @@ fn parse_ids(ids_str: &str) -> Result<Vec<i64>, MemoryError> {
 
     if ids.len() > MAX_STRENGTHEN_SET {
         return Err(MemoryError::InvalidInput(format!(
-            "Cannot strengthen more than {} memories at once (got {})",
+            "Cannot link more than {} memories at once (got {})",
             MAX_STRENGTHEN_SET,
             ids.len()
         )));
